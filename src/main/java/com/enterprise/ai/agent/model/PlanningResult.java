@@ -14,7 +14,7 @@ import java.util.List;
  * The runtime owns action status, execution metadata, and lifecycle management.
  */
 @Data
-@Builder
+@Builder(toBuilder = true)
 @NoArgsConstructor
 @AllArgsConstructor
 public class PlanningResult {

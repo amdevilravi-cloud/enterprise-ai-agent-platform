@@ -2,6 +2,8 @@ package com.enterprise.ai.agent.tools.impl;
 
 import com.enterprise.ai.agent.agent_runtime.ExecutionContext;
 import com.enterprise.ai.agent.artifact.ArtifactManager;
+import com.enterprise.ai.agent.model.Artifact;
+import com.enterprise.ai.agent.model.ArtifactReference;
 import com.enterprise.ai.agent.model.Observation;
 import com.enterprise.ai.agent.model.ToolRequest;
 import com.enterprise.ai.agent.model.ToolResult;
@@ -10,7 +12,9 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.stereotype.Component;
 
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 @Component
@@ -87,14 +91,31 @@ public class DocumentGeneratorTool implements Tool {
 
             // Create artifact
             String artifactName = generateArtifactName(documentType, context.getCurrentMilestone());
-            artifactManager.createArtifact(
+            String artifactKey = determineArtifactKey(context.getCurrentMilestone());
+            Artifact createdArtifact = artifactManager.createArtifact(
                     "document",
                     artifactName,
                     generatedDocument,
                     "text/markdown",
                     "document_generator",
-                    context.getExecutionId()
+                    context.getExecutionId(),
+                    1,
+                    null,
+                    artifactKey
             );
+
+            // Create artifact reference to return in ToolResult
+            ArtifactReference artifactRef = ArtifactReference.builder()
+                    .artifactKey(artifactKey)
+                    .artifactId(createdArtifact.getArtifactId())
+                    .name(artifactName)
+                    .type("document")
+                    .version(createdArtifact.getVersion())
+                    .status(ArtifactReference.ArtifactStatus.CREATED)
+                    .build();
+
+            List<ArtifactReference> artifacts = new ArrayList<>();
+            artifacts.add(artifactRef);
 
             Map<String, Object> data = new HashMap<>();
             data.put("documentType", documentType);
@@ -106,6 +127,7 @@ public class DocumentGeneratorTool implements Tool {
                     .success(true)
                     .result("Document generated successfully: " + artifactName)
                     .data(data)
+                    .artifacts(artifacts)
                     .durationMs(System.currentTimeMillis() - startTime)
                     .build();
 
@@ -146,5 +168,32 @@ public class DocumentGeneratorTool implements Tool {
             baseName = milestone.toLowerCase().replaceAll("\\s+", "_");
         }
         return baseName + ".md";
+    }
+
+    /**
+     * Determine artifact key based on current milestone
+     * Maps milestones to semantic artifact keys
+     * Ensures one artifactKey per milestone for proper versioning
+     */
+    private String determineArtifactKey(String milestone) {
+        if (milestone == null) {
+            return "document";
+        }
+        
+        // Map milestones to artifact keys - one key per milestone type
+        if (milestone.contains("Analyze")) {
+            return "analysis";
+        }
+        if (milestone.contains("Outline") || milestone.contains("Synthesize")) {
+            return "outline";
+        }
+        if (milestone.contains("Write") || milestone.contains("Document") || milestone.contains("Report")) {
+            return "document";
+        }
+        if (milestone.contains("Review")) {
+            return "review";
+        }
+        
+        return "document"; // Default
     }
 }

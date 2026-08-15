@@ -4,20 +4,26 @@ import com.enterprise.ai.agent.persistence.ExecutionContextEntity;
 import com.enterprise.ai.agent.persistence.ExecutionContextRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
 @Component
 @Slf4j
 public class ExecutionContextManager {
 
     private final Map<UUID, ExecutionContext> activeContexts = new ConcurrentHashMap<>();
+    private final Map<UUID, AtomicInteger> updateCounters = new ConcurrentHashMap<>();
     private final ExecutionContextRepository repository;
     private final ObjectMapper objectMapper;
+    
+    @Value("${context.batch.save.threshold:5}")
+    private int batchSaveThreshold;
 
     public ExecutionContextManager(ExecutionContextRepository repository, ObjectMapper objectMapper) {
         this.repository = repository;
@@ -27,6 +33,7 @@ public class ExecutionContextManager {
     public ExecutionContext createContext(String goal) {
         ExecutionContext context = ExecutionContext.create(goal);
         activeContexts.put(context.getExecutionId(), context);
+        updateCounters.put(context.getExecutionId(), new AtomicInteger(0));
         
         // Persist to database
         saveContext(context);
@@ -49,14 +56,34 @@ public class ExecutionContextManager {
     public void updateContext(ExecutionContext context) {
         activeContexts.put(context.getExecutionId(), context);
         
-        // Persist to database
-        saveContext(context);
+        // Increment update counter
+        AtomicInteger counter = updateCounters.computeIfAbsent(context.getExecutionId(), k -> new AtomicInteger(0));
+        int updateCount = counter.incrementAndGet();
         
-        log.debug("Updated execution context: {}", context.getExecutionId());
+        // Batch save: save every N updates or on milestone completion
+        boolean shouldSave = (updateCount % batchSaveThreshold == 0) || 
+                           isMilestoneCompletion(context);
+        
+        if (shouldSave) {
+            saveContext(context);
+            log.debug("Batch saved execution context: {} (update count: {})", context.getExecutionId(), updateCount);
+        } else {
+            log.debug("Deferred save for execution context: {} (update count: {})", context.getExecutionId(), updateCount);
+        }
+    }
+    
+    /**
+     * Force immediate save (for critical updates)
+     */
+    public void forceSaveContext(ExecutionContext context) {
+        activeContexts.put(context.getExecutionId(), context);
+        saveContext(context);
+        log.debug("Force saved execution context: {}", context.getExecutionId());
     }
 
     public void discardContext(UUID executionId) {
         ExecutionContext context = activeContexts.remove(executionId);
+        updateCounters.remove(executionId); // Clean up counter
         if (context != null) {
             context.discard();
             log.info("Discarded execution context: {}", executionId);
@@ -64,6 +91,17 @@ public class ExecutionContextManager {
         
         // Mark as completed in database
         markContextCompleted(executionId);
+    }
+    
+    /**
+     * Check if this update represents a milestone completion
+     */
+    private boolean isMilestoneCompletion(ExecutionContext context) {
+        // Check if a milestone was just completed
+        String currentMilestone = context.getCurrentMilestone();
+        return currentMilestone != null && 
+               (currentMilestone.equals("Complete") || 
+                context.getCompletedMilestones().size() > 0);
     }
 
     public int getActiveContextCount() {
@@ -83,7 +121,7 @@ public class ExecutionContextManager {
                     .completedMilestones(objectMapper.writeValueAsString(context.getCompletedMilestones()))
                     .observations(objectMapper.writeValueAsString(context.getObservations()))
                     .toolResults(objectMapper.writeValueAsString(context.getToolResults()))
-                    .artifacts(objectMapper.writeValueAsString(context.getArtifacts()))
+                    .artifacts(objectMapper.writeValueAsString(context.getArtifactReferences()))
                     .variables(objectMapper.writeValueAsString(context.getVariables()))
                     .knowledgeReferences(objectMapper.writeValueAsString(context.getKnowledgeReferences()))
                     .retryHistory(objectMapper.writeValueAsString(context.getRetryHistory()))
@@ -133,9 +171,9 @@ public class ExecutionContextManager {
                     .toolResults(objectMapper.readValue(entity.getToolResults(),
                             objectMapper.getTypeFactory().constructCollectionType(java.util.List.class, 
                                     com.enterprise.ai.agent.model.ToolResult.class)))
-                    .artifacts(objectMapper.readValue(entity.getArtifacts(),
+                    .artifactReferences(objectMapper.readValue(entity.getArtifacts(),
                             objectMapper.getTypeFactory().constructCollectionType(java.util.List.class, 
-                                    com.enterprise.ai.agent.model.Artifact.class)))
+                                    com.enterprise.ai.agent.model.ArtifactReference.class)))
                     .variables(objectMapper.readValue(entity.getVariables(),
                             objectMapper.getTypeFactory().constructMapType(java.util.Map.class, String.class, Object.class)))
                     .knowledgeReferences(objectMapper.readValue(entity.getKnowledgeReferences(),

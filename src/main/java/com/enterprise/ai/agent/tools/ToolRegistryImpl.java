@@ -31,6 +31,11 @@ public class ToolRegistryImpl implements ToolRegistry {
         log.info("Registered tool: {} - {}", tool.name(), tool.description());
     }
 
+    @Override
+    public boolean hasTool(String toolName) {
+        return tools.containsKey(toolName);
+    }
+
     public int getToolCount() {
         return tools.size();
     }

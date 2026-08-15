@@ -2,6 +2,7 @@ package com.enterprise.ai.agent.memory;
 
 import com.enterprise.ai.agent.model.KnowledgeNode;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.time.LocalDateTime;
@@ -19,6 +20,13 @@ public class KnowledgeMemoryImpl implements KnowledgeMemory {
     
     private final Map<UUID, KnowledgeNode> knowledgeNodes = new ConcurrentHashMap<>();
     private final Map<UUID, List<UUID>> executionKnowledge = new ConcurrentHashMap<>();
+    private final Map<String, LocalDateTime> recentQueries = new ConcurrentHashMap<>();
+    
+    @Value("${knowledge.query.dedup.window.ms:30000}")
+    private long queryDedupWindowMs;
+    
+    @Value("${knowledge.max.recent.queries:100}")
+    private int maxRecentQueries;
     
     @Override
     public KnowledgeNode storeKnowledge(String content, String source, String query, String type, 
@@ -63,6 +71,27 @@ public class KnowledgeMemoryImpl implements KnowledgeMemory {
     
     @Override
     public List<KnowledgeNode> searchKnowledge(String query, int limit) {
+        // Query deduplication check
+        String normalizedQuery = normalizeQuery(query);
+        LocalDateTime now = LocalDateTime.now();
+        
+        // Clean up old queries
+        cleanupOldQueries(now);
+        
+        // Check if this query was recently executed
+        LocalDateTime lastQueryTime = recentQueries.get(normalizedQuery);
+        if (lastQueryTime != null) {
+            long timeSinceLastQuery = java.time.Duration.between(lastQueryTime, now).toMillis();
+            if (timeSinceLastQuery < queryDedupWindowMs) {
+                log.debug("Query deduplication: '{}' was executed {}ms ago, skipping search", 
+                    query, timeSinceLastQuery);
+                return Collections.emptyList(); // Return empty to indicate dedup
+            }
+        }
+        
+        // Record this query
+        recentQueries.put(normalizedQuery, now);
+        
         String lowerQuery = query.toLowerCase();
         
         // Split query into individual words for better matching
@@ -115,6 +144,33 @@ public class KnowledgeMemoryImpl implements KnowledgeMemory {
         
         log.debug("Search for '{}' returned {} results", query, results.size());
         return results;
+    }
+    
+    /**
+     * Normalize query for deduplication by removing extra whitespace and lowercasing
+     */
+    private String normalizeQuery(String query) {
+        if (query == null) return "";
+        return query.trim().toLowerCase().replaceAll("\\s+", " ");
+    }
+    
+    /**
+     * Clean up old queries beyond the dedup window and size limit
+     */
+    private void cleanupOldQueries(LocalDateTime now) {
+        LocalDateTime cutoffTime = now.minusSeconds(queryDedupWindowMs / 1000);
+        
+        // Remove queries older than dedup window
+        recentQueries.entrySet().removeIf(entry -> 
+            entry.getValue().isBefore(cutoffTime));
+        
+        // If still too many queries, remove oldest ones
+        if (recentQueries.size() > maxRecentQueries) {
+            recentQueries.entrySet().stream()
+                .sorted(Map.Entry.comparingByValue())
+                .limit(recentQueries.size() - maxRecentQueries)
+                .forEach(entry -> recentQueries.remove(entry.getKey()));
+        }
     }
     
     /**

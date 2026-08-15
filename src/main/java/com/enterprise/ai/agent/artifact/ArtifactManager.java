@@ -24,6 +24,13 @@ public interface ArtifactManager {
                            String createdBy, UUID relatedExecutionId, int version, UUID parentArtifactId);
     
     /**
+     * Create a new artifact with version information and logical identity key
+     * @param artifactKey Logical identity key (e.g., "analysis", "outline", "document")
+     */
+    Artifact createArtifact(String type, String name, String content, String mimeType, 
+                           String createdBy, UUID relatedExecutionId, int version, UUID parentArtifactId, String artifactKey);
+    
+    /**
      * Get artifact by ID
      */
     Artifact getArtifact(UUID artifactId);

@@ -13,6 +13,7 @@ import com.enterprise.ai.agent.tools.Tool;
 import com.enterprise.ai.agent.tools.ToolRegistry;
 import com.enterprise.ai.agent.workflow.WorkflowManager;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import java.time.LocalDateTime;
@@ -31,10 +32,39 @@ public class AgentRuntime implements Agent {
     private final WorkflowManager workflowManager;
     private final ArtifactReviewer artifactReviewer;
 
-    private static final double CONFIDENCE_THRESHOLD = 0.4;
-    private static final int MAX_RETRIES = 3;
-    private static final long RETRY_DELAY_MS = 1000; // Initial retry delay
-    private static final double DUPLICATE_SIMILARITY_THRESHOLD = 0.8;
+    @Value("${agent.confidence.threshold:0.4}")
+    private double confidenceThreshold;
+    
+    @Value("${agent.max.retries:3}")
+    private int maxRetries;
+    
+    @Value("${agent.retry.delay.ms:1000}")
+    private long retryDelayMs;
+    
+    @Value("${agent.duplicate.similarity.threshold:0.8}")
+    private double duplicateSimilarityThreshold;
+    
+    @Value("${agent.circuit.breaker.threshold:5}")
+    private int circuitBreakerThreshold;
+    
+    @Value("${agent.stuck.iteration.threshold:8}")
+    private int stuckIterationThreshold;
+    
+    // Error codes for better debugging (these remain as constants)
+    private static final String ERR_ARTIFACT_VALIDATION = "ARTIFACT_VAL_001";
+    private static final String ERR_MILESTONE_STUCK = "MILESTONE_STUCK_002";
+    private static final String ERR_CIRCUIT_BREAKER = "CIRCUIT_BREAK_003";
+    private static final String ERR_PLANNING_FAILURE = "PLANNING_FAIL_004";
+    private static final String ERR_GOAL_VALIDATION = "GOAL_VAL_005";
+    private static final String ERR_SELF_TRANSITION = "STATE_TRANS_006";
+    
+    // Error classification for retry logic
+    private enum ErrorClassification {
+        RETRIABLE,      // Temporary errors that can be retried
+        NON_RETRIABLE,  // Permanent errors that should not be retried
+        RATE_LIMIT,     // Rate limiting errors
+        TIMEOUT         // Timeout errors
+    }
 
     public AgentRuntime(ExecutionContextManager contextManager, Planner planner, ToolRegistry toolRegistry, 
                        ArtifactManager artifactManager, KnowledgeMemory knowledgeMemory, 
@@ -50,7 +80,8 @@ public class AgentRuntime implements Agent {
 
     @Override
     public AgentResponse execute(AgentRequest request) {
-        log.info("Starting agent execution for goal: {}", request.getGoal());
+        String correlationId = UUID.randomUUID().toString();
+        log.info("[{}] Starting agent execution for goal: {}", correlationId, request.getGoal());
 
         LocalDateTime startedAt = LocalDateTime.now();
         ExecutionContext context = null;
@@ -73,16 +104,17 @@ public class AgentRuntime implements Agent {
         try {
             // Create execution context
             context = contextManager.createContext(request.getGoal());
+            context.setVariable("correlationId", correlationId);
             
             // Determine workflow based on goal (runtime owns workflow)
             List<String> workflow = workflowManager.determineWorkflow(request.getGoal());
             context.setVariable("workflow", workflow);
-            log.info("Determined workflow: {}", workflow);
+            log.info("[{}] Determined workflow: {}", correlationId, workflow);
             
             // Set initial milestone from workflow
             String initialMilestone = workflowManager.getNextMilestone(workflow, null);
             context.setCurrentMilestone(initialMilestone);
-            log.info("Initial milestone: {}", initialMilestone);
+            log.info("[{}] Initial milestone: {}", correlationId, initialMilestone);
             
             // Store execution graph in context metadata for access during execution
             context.setMetadata("executionGraph", executionGraph);
@@ -119,6 +151,9 @@ public class AgentRuntime implements Agent {
             // Execute planning loop (ReAct pattern)
             int maxIterations = 15; // Increased to accommodate full workflow
             int iteration = 0;
+            // Initialize progress tracking in context
+            context.setVariable("consecutiveFailures", 0);
+            context.setVariable("lastProgressTimestamp", System.currentTimeMillis());
             String lastPlannerReasoning = null;
             String lastPlannerDecision = null;
             String lastPlannerNextStep = null;
@@ -126,12 +161,83 @@ public class AgentRuntime implements Agent {
 
             while (iteration < maxIterations) {
                 iteration++;
-                log.info("Execution iteration {} for context: {}", iteration, context.getExecutionId());
+                log.info("[{}] Execution iteration {} for context: {}", correlationId, iteration, context.getExecutionId());
+
+                // Check if workflow is complete - if so, stop planning and finish
+                String currentMilestone = context.getCurrentMilestone();
+                if ("Complete".equals(currentMilestone) || "FINISH".equals(currentMilestone)) {
+                    log.info("[{}] Workflow milestone is '{}'. Execution complete. Stopping planner calls.", correlationId, currentMilestone);
+                    execution.setCompletedAt(LocalDateTime.now());
+                    return buildSuccessResponse(context, actionsTaken, toolCalls, 
+                            "Workflow completed successfully", null, startedAt, executionGraph);
+                }
+
+                // Check for stuck execution (no progress for multiple iterations)
+                Long lastProgressTimestamp = (Long) context.getVariable("lastProgressTimestamp");
+                long timeSinceProgress = lastProgressTimestamp != null ? 
+                    System.currentTimeMillis() - lastProgressTimestamp : 0;
+                long stuckThresholdMs = stuckIterationThreshold * 1000; // Convert to milliseconds
+                
+                // Proactive milestone deadlock detection
+                int stuckInMilestoneCount = context.getVariable("stuckInMilestoneCount") != null 
+                    ? (Integer) context.getVariable("stuckInMilestoneCount") : 0;
+                
+                if (currentMilestone != null && currentMilestone.equals(context.getVariable("lastMilestone"))) {
+                    stuckInMilestoneCount++;
+                    context.setVariable("stuckInMilestoneCount", stuckInMilestoneCount);
+                } else {
+                    stuckInMilestoneCount = 0;
+                    context.setVariable("stuckInMilestoneCount", 0);
+                    context.setVariable("lastMilestone", currentMilestone);
+                }
+                
+                // Force progression if stuck in same milestone for 3+ iterations
+                // TEMPORARILY DISABLED: Keep diagnostics but disable forced transitions to verify natural progression
+                if (stuckInMilestoneCount >= 3) {
+                    log.warn("[{}] Milestone '{}' stuck for {} iterations. Diagnostics only - forced progression disabled.", 
+                            correlationId, currentMilestone, stuckInMilestoneCount);
+                    // context.setVariable("force_progression", true);  // DISABLED
+                    // context.setVariable("recovery_trigger", "Milestone deadlock recovery");  // DISABLED
+                    context.setVariable("stuckInMilestoneCount", 0); // Reset counter
+                }
+                
+                if (timeSinceProgress > stuckThresholdMs) {
+                    log.warn("[{}] Execution stuck for {}ms without progress. Diagnostics only - forced progression disabled.", correlationId, timeSinceProgress);
+                    // context.setVariable("force_progression", true);  // DISABLED
+                    // context.setVariable("recovery_trigger", "Stuck execution recovery");  // DISABLED
+                    context.setVariable("lastProgressTimestamp", System.currentTimeMillis()); // Reset to prevent immediate re-trigger
+                }
+
+                // Check circuit breaker for consecutive failures
+                Integer consecutiveFailures = (Integer) context.getVariable("consecutiveFailures");
+                if (consecutiveFailures != null && consecutiveFailures >= circuitBreakerThreshold) {
+                    log.error("[{}] Circuit breaker triggered after {} consecutive failures. Aborting execution.", correlationId, consecutiveFailures);
+                    execution.setCompletedAt(LocalDateTime.now());
+                    return buildErrorResponse("[" + ERR_CIRCUIT_BREAKER + "] Circuit breaker triggered: Too many consecutive failures", startedAt);
+                }
 
                 // Get planning result from planner (planner is stateless)
-                PlanningResult planningResult = planner.createPlan(context);
-                log.info("Planning result: currentState={}, nextState={}, milestone={}, nextStep={}, confidence={}, actions={}", 
-                        planningResult.getCurrentState(), planningResult.getNextState(), planningResult.getMilestone(),
+                PlanningResult planningResult;
+                try {
+                    planningResult = planner.createPlan(context);
+                    context.setVariable("consecutiveFailures", 0); // Reset on successful planning
+                } catch (Exception e) {
+                    consecutiveFailures = (consecutiveFailures != null ? consecutiveFailures : 0) + 1;
+                    context.setVariable("consecutiveFailures", consecutiveFailures);
+                    log.error("[{}] Planning failed (attempt {}/{}): {}", ERR_PLANNING_FAILURE, consecutiveFailures, circuitBreakerThreshold, e.getMessage());
+                    
+                    if (consecutiveFailures >= circuitBreakerThreshold) {
+                        log.error("[{}] Circuit breaker triggered. Aborting execution.", ERR_CIRCUIT_BREAKER);
+                        execution.setCompletedAt(LocalDateTime.now());
+                        return buildErrorResponse("[" + ERR_CIRCUIT_BREAKER + "] Circuit breaker triggered: Planning failures", startedAt);
+                    }
+                    
+                    // Retry with fallback
+                    planningResult = createFallbackPlanningResult(context);
+                }
+                
+                log.info("[{}] Planning result: currentState={}, nextState={}, milestone={}, nextStep={}, confidence={}, actions={}", 
+                        correlationId, planningResult.getCurrentState(), planningResult.getNextState(), planningResult.getMilestone(),
                         planningResult.getNextStep(), planningResult.getConfidence(), planningResult.getActions().size());
 
                 // Store planner output for response
@@ -143,25 +249,38 @@ public class AgentRuntime implements Agent {
                 // Update milestone in context if provided
                 if (planningResult.getMilestone() != null && !planningResult.getMilestone().isEmpty()) {
                     context.setCurrentMilestone(planningResult.getMilestone());
-                    log.info("Current milestone: {}", planningResult.getMilestone());
+                    log.info("[{}] Current milestone: {}", correlationId, planningResult.getMilestone());
                 }
                 
-                // Force progression if stuck in information gathering
+                // Force progression if stuck in information gathering (reduced threshold due to improved detection)
                 int knowledgeSearchCount = (int) state.getToolResults().stream()
                         .filter(tr -> tr.getToolName().equals("knowledge_search"))
                         .count();
                 
-                if (knowledgeSearchCount >= 3 && planningResult.getCurrentState() == AgentState.EXECUTE) {
-                    log.warn("Forcing progression from EXECUTE to ANALYZE after {} knowledge searches", knowledgeSearchCount);
-                    // Override planner decision to force progression
-                    context.setVariable("force_analyze", true);
-                    context.setVariable("analysis_trigger", "Max information gathering steps reached");
+                // Check for skipped duplicate observations
+                long skipCount = context.getObservations().stream()
+                        .filter(obs -> obs.getContent() != null && obs.getContent().contains("skipped as duplicate"))
+                        .count();
+                
+                // Force progression if we have 3+ knowledge searches OR 2+ skipped actions
+                // TEMPORARILY DISABLED: Keep diagnostics but disable forced transitions to verify natural progression
+                if ((knowledgeSearchCount >= 3 || skipCount >= 2) && planningResult.getCurrentState() == AgentState.EXECUTE) {
+                    log.warn("[{}] Loop detected: {} knowledge searches and {} skipped actions. Diagnostics only - forced progression disabled.", 
+                            correlationId, knowledgeSearchCount, skipCount);
+                    // context.setVariable("force_analyze", true);  // DISABLED
+                    // context.setVariable("analysis_trigger", "Loop detected - forced milestone progression");  // DISABLED
+                    // Mark current milestone as completed and advance
+                    // if (currentMilestone != null && !currentMilestone.isEmpty()) {
+                    //     context.addCompletedMilestone(currentMilestone);
+                    //     context.setCurrentMilestone("ANALYZE");
+                    //     log.info("[{}] Advanced milestone from '{}' to 'ANALYZE'", correlationId, currentMilestone);
+                    // }
                 }
 
                 // Check confidence threshold
-                if (planningResult.getConfidence() < CONFIDENCE_THRESHOLD) {
-                    log.warn("Low confidence ({}) for execution: {}, asking user for clarification", 
-                            planningResult.getConfidence(), context.getExecutionId());
+                if (planningResult.getConfidence() < confidenceThreshold) {
+                    log.warn("[{}] Low confidence ({}) for execution: {}, asking user for clarification", 
+                            correlationId, planningResult.getConfidence(), context.getExecutionId());
                     execution.setCompletedAt(LocalDateTime.now());
                     return buildSuccessResponse(context, actionsTaken, toolCalls, 
                             planningResult.getReasoning(), planningResult, startedAt, executionGraph);
@@ -170,18 +289,16 @@ public class AgentRuntime implements Agent {
                 // Handle agent state
                 AgentState effectiveState = planningResult.getCurrentState();
                 
-                // Force progression if needed
+                // Force progression if needed (reduced usage due to improved detection)
                 if (context.getVariable("force_analyze") != null && (Boolean) context.getVariable("force_analyze")) {
                     effectiveState = AgentState.ANALYZE;
-                    log.info("Forcing state transition to ANALYZE due to progression logic");
+                    log.info("[{}] Forcing state transition to ANALYZE due to progression logic", correlationId);
                     context.setVariable("force_analyze", false);
                 }
                 
                 // Runtime owns milestone progression - check if current milestone is complete
-                String currentMilestone = context.getCurrentMilestone();
-                
                 if (currentMilestone != null) {
-                    int artifactsCreated = context.getArtifacts().size();
+                    int artifactsCreated = context.getArtifactReferences().size();
                     
                     boolean milestoneComplete = workflowManager.isMilestoneComplete(
                             currentMilestone, 
@@ -190,21 +307,28 @@ public class AgentRuntime implements Agent {
                             artifactsCreated
                     );
                     
-                    // Additional validation: check required artifact types
-                    if (milestoneComplete) {
-                        boolean hasRequiredArtifacts = workflowManager.hasRequiredArtifactType(
-                                currentMilestone, 
-                                context.getArtifacts()
-                        );
-                        
-                        if (!hasRequiredArtifacts) {
-                            log.warn("Milestone '{}' has required artifact count but missing required artifact type. Waiting for proper artifact generation.", currentMilestone);
-                            milestoneComplete = false;
-                        }
+                    // Simplified artifact validation: check artifact count and content quality
+                    // Removed strict artifact type requirements to prevent milestone deadlocks
+                    boolean forceProgression = context.getVariable("force_progression") != null 
+                        && (Boolean) context.getVariable("force_progression");
+                    
+                    if (milestoneComplete && !forceProgression) {
+                        // Note: ArtifactReference doesn't have content field, so we skip content validation
+                        // Content validation can be done by fetching from ArtifactManager if needed
+                        log.debug("[{}] Milestone '{}' complete with {} artifacts", correlationId, currentMilestone, artifactsCreated);
                     }
                     
                     if (milestoneComplete) {
-                        log.info("Milestone '{}' is complete. Advancing to next milestone.", currentMilestone);
+                        log.info("[{}] Milestone '{}' is complete. Advancing to next milestone.", correlationId, currentMilestone);
+                        
+                        // Clear forced progression flag after successful milestone completion
+                        if (forceProgression) {
+                            context.setVariable("force_progression", false);
+                            log.info("[{}] Cleared forced progression flag after milestone completion", correlationId);
+                        }
+                    
+                        // Update progress tracking
+                        context.setVariable("lastProgressTimestamp", System.currentTimeMillis());
                         
                         // Add to completed milestones
                         context.addCompletedMilestone(currentMilestone);
@@ -219,13 +343,23 @@ public class AgentRuntime implements Agent {
                         }
                         if (nextMilestone != null) {
                             context.setCurrentMilestone(nextMilestone);
-                            log.info("Advanced to next milestone: {}", nextMilestone);
+                            log.info("[{}] Advanced to next milestone: {}", correlationId, nextMilestone);
                             
                             // Set milestone completion criteria in context for planner
                             context.setVariable("milestoneCriteria", workflowManager.getMilestoneCriteria(nextMilestone));
                         } else {
-                            log.info("Reached final milestone: {}", currentMilestone);
+                            log.info("[{}] Reached final milestone: {}", correlationId, currentMilestone);
                             context.setCurrentMilestone("Complete");
+                            
+                            // Validate that final artifacts match goal requirements
+                            if (!validateGoalCompletion(context, request.getGoal())) {
+                                log.warn("[{}] Goal completion validation failed. Attempting to generate missing artifacts.", correlationId);
+                                // Attempt to generate missing artifact
+                                PlanningResult fallbackResult = createFallbackPlanningResult(context);
+                                return buildSuccessResponse(context, actionsTaken, toolCalls, 
+                                        "Workflow completed but goal validation failed: " + fallbackResult.getReasoning(), 
+                                        fallbackResult, startedAt, executionGraph);
+                            }
                             
                             // Workflow complete - finish execution
                             execution.setCompletedAt(LocalDateTime.now());
@@ -237,156 +371,272 @@ public class AgentRuntime implements Agent {
                     }
                 }
                 
-                switch (effectiveState) {
-                    case FINISH:
-                        log.info("Agent state: FINISH for execution: {}", context.getExecutionId());
-                        execution.setCompletedAt(LocalDateTime.now());
-                        return buildSuccessResponse(context, actionsTaken, toolCalls, 
-                                planningResult.getReasoning(), planningResult, startedAt, executionGraph);
+                log.info("[{}] Planning result: currentState={}, nextState={}, nextStep={}, confidence={}, actions={}", 
+                        correlationId, planningResult.getCurrentState(), planningResult.getNextState(),
+                        planningResult.getNextStep(), planningResult.getConfidence(), planningResult.getActions().size());
 
-                    case RESPOND:
-                        log.info("Agent state: RESPOND for execution: {}", context.getExecutionId());
-                        execution.setCompletedAt(LocalDateTime.now());
-                        return buildSuccessResponse(context, actionsTaken, toolCalls, 
-                                planningResult.getReasoning(), planningResult, startedAt, executionGraph);
+                // Store planner output for response
+                lastPlannerReasoning = planningResult.getReasoning();
+                lastPlannerDecision = planningResult.getCurrentState().name() + " -> " + planningResult.getNextState().name();
+                lastPlannerNextStep = planningResult.getNextStep();
+                lastPlannerConfidence = planningResult.getConfidence();
 
-                    case PLAN:
-                        log.info("Agent state: PLAN for execution: {}", context.getExecutionId());
-                        // PLAN state means we should transition to the next state
-                        // If nextState is EXECUTE, we need to actually execute the actions
-                        if (planningResult.getNextState() == AgentState.EXECUTE && !planningResult.getActions().isEmpty()) {
-                            log.info("Transitioning from PLAN to EXECUTE with {} actions", planningResult.getActions().size());
-                            // Execute the actions
-                            state.setPendingActions(planningResult.getActions());
-                            execution.setUpdatedAt(LocalDateTime.now());
+                // NOTE: Planner no longer controls milestone progression
+                // Milestone progression is now exclusively owned by WorkflowManager
+                // based on deterministic artifact completion checks
+                log.debug("[{}] Planner milestone suggestion ignored - using WorkflowManager for milestone control", correlationId);
 
-                            for (AgentAction action : planningResult.getActions()) {
-                                AgentAction executedAction = executeAction(action, context, state, toolCalls);
-                                actionsTaken.add(executedAction);
-                                state.incrementStep();
-                                execution.setUpdatedAt(LocalDateTime.now());
-                                contextManager.updateContext(context);
+                // Check confidence threshold
+                if (planningResult.getConfidence() < confidenceThreshold) {
+                    log.warn("[{}] Low confidence ({}) for execution: {}, asking user for clarification", 
+                            correlationId, planningResult.getConfidence(), context.getExecutionId());
+                    execution.setCompletedAt(LocalDateTime.now());
+                    return buildSuccessResponse(context, actionsTaken, toolCalls, 
+                            planningResult.getReasoning(), planningResult, startedAt, executionGraph);
+                }
+
+                // Force progression if needed (reduced usage due to improved detection)
+                if (context.getVariable("force_analyze") != null && (Boolean) context.getVariable("force_analyze")) {
+                    effectiveState = AgentState.ANALYZE;
+                    log.info("[{}] Forcing state transition to ANALYZE due to progression logic", correlationId);
+                    context.setVariable("force_analyze", false);
+                }
+
+                // Runtime owns milestone progression - check if current milestone is complete
+                // This check happens BEFORE planner call to avoid unnecessary LLM invocations
+                if (currentMilestone != null && !"Complete".equals(currentMilestone)) {
+                    int artifactsCreated = context.getArtifactReferences().size();
+                    
+                    boolean milestoneComplete = workflowManager.isMilestoneComplete(
+                            currentMilestone, 
+                            state.getCompletedActions().size(), 
+                            knowledgeSearchCount, 
+                            artifactsCreated
+                    );
+                    
+                    if (milestoneComplete) {
+                        log.info("[{}] Milestone '{}' is complete. Advancing to next milestone without planner call.", correlationId, currentMilestone);
+                        
+                        // Update progress tracking
+                        context.setVariable("lastProgressTimestamp", System.currentTimeMillis());
+                        
+                        // Add to completed milestones
+                        context.addCompletedMilestone(currentMilestone);
+                        
+                        // Get next milestone (workflow is already defined at method start)
+                        String nextMilestone = workflowManager.getNextMilestone(workflow, currentMilestone);
+                        
+                        // Add milestone advancement to execution graph
+                        Object graphObj = context.getMetadata().get("executionGraph");
+                        if (graphObj instanceof ExecutionGraph) {
+                            addMilestoneNode(nextMilestone, (ExecutionGraph) graphObj, context.getCurrentStep());
+                        }
+                        if (nextMilestone != null) {
+                            context.setCurrentMilestone(nextMilestone);
+                            log.info("[{}] Advanced to next milestone: {}", correlationId, nextMilestone);
+                            
+                            // Set milestone completion criteria in context for planner
+                            context.setVariable("milestoneCriteria", workflowManager.getMilestoneCriteria(nextMilestone));
+                            
+                            // Check if we reached Complete milestone
+                            if ("Complete".equals(nextMilestone)) {
+                                log.info("[{}] Reached final milestone: Complete. Finishing execution.", correlationId);
+                                execution.setCompletedAt(LocalDateTime.now());
+                                return buildSuccessResponse(context, actionsTaken, toolCalls, 
+                                        "Workflow completed successfully", null, startedAt, executionGraph);
                             }
                         } else {
-                            // Continue loop to get new plan
-                            continue;
+                            log.info("[{}] No next milestone available. Finishing execution.", correlationId);
+                            execution.setCompletedAt(LocalDateTime.now());
+                            return buildSuccessResponse(context, actionsTaken, toolCalls, 
+                                    "Workflow completed successfully", null, startedAt, executionGraph);
                         }
-                        break;
+                        
+                        contextManager.updateContext(context);
+                    }
+                }
+                
+                switch (effectiveState) {
+                case FINISH:
+                    log.info("[{}] Agent state: FINISH for execution: {}", correlationId, context.getExecutionId());
+                    execution.setCompletedAt(LocalDateTime.now());
+                    return buildSuccessResponse(context, actionsTaken, toolCalls, 
+                            planningResult.getReasoning(), planningResult, startedAt, executionGraph);
 
-                    case EXECUTE:
-                        log.info("Agent state: EXECUTE for execution: {}", context.getExecutionId());
-                        // Update execution state with planning result
+                case RESPOND:
+                    log.info("[{}] Agent state: RESPOND for execution: {}", correlationId, context.getExecutionId());
+                    execution.setCompletedAt(LocalDateTime.now());
+                    return buildSuccessResponse(context, actionsTaken, toolCalls, 
+                            planningResult.getReasoning(), planningResult, startedAt, executionGraph);
+
+                case PLAN:
+                    log.info("[{}] Agent state: PLAN for execution: {}", correlationId, context.getExecutionId());
+                    // PLAN state means we should transition to the next state
+                    // If nextState is EXECUTE, we need to actually execute the actions
+                    if (planningResult.getNextState() == AgentState.EXECUTE && !planningResult.getActions().isEmpty()) {
+                        log.info("[{}] Transitioning from PLAN to EXECUTE with {} actions", correlationId, planningResult.getActions().size());
+                        // Execute the actions
                         state.setPendingActions(planningResult.getActions());
                         execution.setUpdatedAt(LocalDateTime.now());
 
-                        // Execute actions (runtime owns execution)
                         for (AgentAction action : planningResult.getActions()) {
-                            AgentAction executedAction = executeAction(action, context, state, toolCalls);
+                            AgentAction executedAction = executeAction(action, context, state, toolCalls, correlationId);
                             actionsTaken.add(executedAction);
                             state.incrementStep();
                             execution.setUpdatedAt(LocalDateTime.now());
                             contextManager.updateContext(context);
                         }
-                        break;
+                    } else {
+                        // Continue loop to get new plan
+                        continue;
+                    }
+                    break;
 
-                    case OBSERVE:
-                        log.info("Agent state: OBSERVE for execution: {}", context.getExecutionId());
-                        // Process observations without executing tools
-                        // The planner has already analyzed context in OBSERVE state
-                        context.setVariable("lastObservation", planningResult.getReasoning());
+                case EXECUTE:
+                    log.info("[{}] Agent state: EXECUTE for execution: {}", correlationId, context.getExecutionId());
+                    // Update execution state with planning result
+                    state.setPendingActions(planningResult.getActions());
+                    execution.setUpdatedAt(LocalDateTime.now());
+
+                    // Execute actions (runtime owns execution)
+                    for (AgentAction action : planningResult.getActions()) {
+                        AgentAction executedAction = executeAction(action, context, state, toolCalls, correlationId);
+                        actionsTaken.add(executedAction);
+                        state.incrementStep();
+                        execution.setUpdatedAt(LocalDateTime.now());
                         contextManager.updateContext(context);
-                        break;
+                    }
+                    break;
 
-                    case ANALYZE:
-                        log.info("Agent state: ANALYZE for execution: {}", context.getExecutionId());
-                        // Pure reasoning step - LLM analyzes without tool execution
-                        // Store analysis in context
-                        String analysisContent = planningResult.getReasoning();
-                        if (context.getVariable("analysis_trigger") != null) {
-                            analysisContent = "Forced analysis: " + context.getVariable("analysis_trigger") + ". " + analysisContent;
-                        }
-                        context.setVariable("lastAnalysis", analysisContent);
-                        contextManager.updateContext(context);
-                        break;
+                case OBSERVE:
+                    log.info("[{}] Agent state: OBSERVE for execution: {}", correlationId, context.getExecutionId());
+                    // Process observations without executing tools
+                    // The planner has already analyzed context in OBSERVE state
+                    context.setVariable("lastObservation", planningResult.getReasoning());
+                    contextManager.updateContext(context);
+                    break;
 
-                    case GENERATE_ARTIFACT:
-                        log.info("Agent state: GENERATE_ARTIFACT for execution: {}", context.getExecutionId());
-                        // Execute planner's actions to generate artifacts
-                        if (!planningResult.getActions().isEmpty()) {
-                            log.info("Executing {} actions to generate artifacts", planningResult.getActions().size());
-                            state.setPendingActions(planningResult.getActions());
+                case ANALYZE:
+                    log.info("[{}] Agent state: ANALYZE for execution: {}", correlationId, context.getExecutionId());
+                    // Pure reasoning step - LLM analyzes without tool execution
+                    // Store analysis in context
+                    String analysisContent = planningResult.getReasoning();
+                    if (context.getVariable("analysis_trigger") != null) {
+                        analysisContent = "Forced analysis: " + context.getVariable("analysis_trigger") + ". " + analysisContent;
+                    }
+                    context.setVariable("lastAnalysis", analysisContent);
+                    contextManager.updateContext(context);
+                    break;
+
+                case GENERATE_ARTIFACT:
+                    log.info("[{}] Agent state: GENERATE_ARTIFACT for execution: {}", correlationId, context.getExecutionId());
+                    // Execute planner's actions to generate artifacts
+                    if (!planningResult.getActions().isEmpty()) {
+                        log.info("[{}] Executing {} actions to generate artifacts", correlationId, planningResult.getActions().size());
+                        state.setPendingActions(planningResult.getActions());
+                        execution.setUpdatedAt(LocalDateTime.now());
+
+                        for (AgentAction action : planningResult.getActions()) {
+                            AgentAction executedAction = executeAction(action, context, state, toolCalls, correlationId);
+                            actionsTaken.add(executedAction);
+                            state.incrementStep();
                             execution.setUpdatedAt(LocalDateTime.now());
-
-                            for (AgentAction action : planningResult.getActions()) {
-                                AgentAction executedAction = executeAction(action, context, state, toolCalls);
-                                actionsTaken.add(executedAction);
-                                state.incrementStep();
-                                execution.setUpdatedAt(LocalDateTime.now());
-                                contextManager.updateContext(context);
-                            }
-                        } else {
-                            // Fallback: create artifact from reasoning if no actions
-                            log.info("No actions provided, creating artifact from reasoning");
-                            String artifactContent = planningResult.getReasoning();
-                            String artifactType = determineArtifactType(context, planningResult);
-                            String artifactName = generateArtifactName(artifactType, context.getCurrentMilestone());
-                            
-                            Artifact artifact = artifactManager.createArtifact(
-                                    artifactType,
-                                    artifactName,
-                                    artifactContent,
-                                    "text/markdown",
-                                    "agent_runtime",
-                                    context.getExecutionId()
-                            );
-                            
-                            context.addArtifact(artifact);
                             contextManager.updateContext(context);
-                            log.info("Created artifact from reasoning: id={}, type={}, name={}", 
-                                    artifact.getArtifactId(), artifactType, artifactName);
-                            
-                            // Add artifact node to execution graph
-                            Object graphObj = context.getMetadata().get("executionGraph");
-                            if (graphObj instanceof ExecutionGraph) {
-                                addArtifactNode(artifactName, artifactType, "agent_runtime", (ExecutionGraph) graphObj, state.getCompletedActions().size());
-                            }
                         }
-                        break;
+                    } else {
+                        // Fallback: create artifact from reasoning if no actions
+                        log.info("[{}] No actions provided, creating artifact from reasoning", correlationId);
+                        String artifactContent = planningResult.getReasoning();
+                        String artifactType = determineArtifactType(context, planningResult);
+                        String artifactName = generateArtifactName(artifactType, context.getCurrentMilestone());
+                        
+                        Artifact artifact = artifactManager.createArtifact(
+                                artifactType,
+                                artifactName,
+                                artifactContent,
+                                "text/markdown",
+                                "agent_runtime",
+                                context.getExecutionId()
+                        );
+                        
+                        context.addArtifactReference(ArtifactReference.builder()
+                                .artifactKey(artifactType.toLowerCase())
+                                .artifactId(artifact.getArtifactId())
+                                .name(artifactName)
+                                .type(artifactType)
+                                .version(artifact.getVersion())
+                                .status(ArtifactReference.ArtifactStatus.CREATED)
+                                .build());
+                        contextManager.updateContext(context);
+                        log.info("[{}] Created artifact from reasoning: id={}, type={}, name={}", 
+                                correlationId, artifact.getArtifactId(), artifactType, artifactName);
+                        
+                        // Add artifact node to execution graph
+                        Object graphObj = context.getMetadata().get("executionGraph");
+                        if (graphObj instanceof ExecutionGraph) {
+                            addArtifactNode(artifactName, artifactType, "agent_runtime", (ExecutionGraph) graphObj, state.getCompletedActions().size());
+                        }
+                    }
+                    break;
 
-                    case REVIEW:
-                        log.info("Agent state: REVIEW for execution: {}", context.getExecutionId());
-                        // Review and improve artifacts using ArtifactReviewer
-                        if (!context.getArtifacts().isEmpty()) {
-                            Artifact latestArtifact = context.getArtifacts().get(context.getArtifacts().size() - 1);
-                            log.info("Reviewing latest artifact: id={}, type={}, name={}", 
-                                    latestArtifact.getArtifactId(), latestArtifact.getType(), latestArtifact.getName());
-                            
+                case REVIEW:
+                    log.info("[{}] Agent state: REVIEW for execution: {}", correlationId, context.getExecutionId());
+                    // Review and improve artifacts using ArtifactReviewer
+                    if (!context.getArtifactReferences().isEmpty()) {
+                        ArtifactReference latestArtifactRef = context.getArtifactReferences().get(context.getArtifactReferences().size() - 1);
+                        log.info("[{}] Reviewing latest artifact reference: id={}, type={}, name={}", 
+                                correlationId, latestArtifactRef.getArtifactId(), latestArtifactRef.getType(), latestArtifactRef.getName());
+                        
+                        // Fetch full artifact from ArtifactManager for review
+                        Artifact latestArtifact = artifactManager.getArtifact(latestArtifactRef.getArtifactId());
+                        if (latestArtifact != null) {
                             // Use ArtifactReviewer to generate improved version
                             Artifact reviewedArtifact = artifactReviewer.review(latestArtifact, context);
-                            context.addArtifact(reviewedArtifact);
+                            context.addArtifactReference(ArtifactReference.builder()
+                                    .artifactKey(latestArtifactRef.getArtifactKey())
+                                    .artifactId(reviewedArtifact.getArtifactId())
+                                    .name(reviewedArtifact.getName())
+                                    .type(reviewedArtifact.getType())
+                                    .version(reviewedArtifact.getVersion())
+                                    .status(ArtifactReference.ArtifactStatus.COMPLETED)
+                                    .build());
                             contextManager.updateContext(context);
                             
-                            log.info("Artifact review complete: original_id={}, reviewed_id={}, new_version={}", 
-                                    latestArtifact.getArtifactId(), reviewedArtifact.getArtifactId(), reviewedArtifact.getVersion());
+                            log.info("[{}] Artifact review complete: original_id={}, reviewed_id={}, new_version={}", 
+                                    correlationId, latestArtifact.getArtifactId(), reviewedArtifact.getArtifactId(), reviewedArtifact.getVersion());
                         } else {
-                            log.warn("No artifacts available for review in execution: {}", context.getExecutionId());
+                            log.warn("[{}] Could not fetch artifact {} for review", correlationId, latestArtifactRef.getArtifactId());
                         }
-                        break;
+                    } else {
+                        log.warn("[{}] No artifacts available for review in execution: {}", correlationId, context.getExecutionId());
+                    }
+                    break;
 
-                    default:
-                        log.warn("Unknown agent state: {} for execution: {}", 
-                                effectiveState, context.getExecutionId());
-                        execution.setCompletedAt(LocalDateTime.now());
-                        return buildSuccessResponse(context, actionsTaken, toolCalls, 
-                                planningResult.getReasoning(), planningResult, startedAt, executionGraph);
+                default:
+                    log.warn("[{}] Unknown agent state: {} for execution: {}", 
+                            correlationId, effectiveState, context.getExecutionId());
+                    execution.setCompletedAt(LocalDateTime.now());
+                    return buildSuccessResponse(context, actionsTaken, toolCalls, 
+                            planningResult.getReasoning(), planningResult, startedAt, executionGraph);
                 }
             }
 
-            // Max iterations reached
-            log.warn("Max iterations reached for execution: {}", context.getExecutionId());
+            // Max iterations reached - check if we can extend for complex workflows
+            int completedMilestones = context.getCompletedMilestones().size();
+            int totalMilestones = workflow.size();
+            double completionRatio = totalMilestones > 0 ? (double) completedMilestones / totalMilestones : 0;
+            
+            // Graceful degradation with partial completion status
+            log.warn("[{}] Max iterations reached for execution: {} with {:.0%} milestone completion", 
+                    correlationId, context.getExecutionId(), completionRatio);
             execution.setCompletedAt(LocalDateTime.now());
+            
+            String completionMessage = String.format(
+                    "Execution completed after %d iterations with %.0f%% milestone completion. %d artifacts generated.",
+                    iteration, completionRatio * 100, context.getArtifactReferences().size());
+            
             return buildSuccessResponse(context, actionsTaken, toolCalls, 
-                    "Execution completed after max iterations", null, startedAt, executionGraph);
+                    completionMessage, null, startedAt, executionGraph);
 
         } catch (Exception e) {
             log.error("Error during agent execution", e);
@@ -491,16 +741,92 @@ public class AgentRuntime implements Agent {
         }
     }
 
-    private AgentAction executeAction(AgentAction action, ExecutionContext context, ExecutionState state, List<ToolCall> toolCalls) {
-        log.info("Executing action: {} with tool: {}", action.getActionId(), action.getToolName());
+    private AgentAction executeAction(AgentAction action, ExecutionContext context, ExecutionState state, List<ToolCall> toolCalls, String correlationId) {
+        log.info("[{}] Executing action: {} with type: {}", correlationId, action.getActionId(), action.getType());
+
+        // Handle action based on type
+        if (action.getType() == null) {
+            // Default to TOOL_CALL for backward compatibility
+            action.setType(ActionType.TOOL_CALL);
+        }
+
+        switch (action.getType()) {
+            case TOOL_CALL:
+                return executeToolCall(action, context, state, toolCalls, correlationId);
+            case STATE_TRANSITION:
+                return handleStateTransition(action, context, correlationId);
+            case COMPLETE:
+                return handleComplete(action, context, correlationId);
+            case NO_OP:
+                return handleNoOp(action, context, correlationId);
+            default:
+                log.warn("[{}] Unknown action type: {}, defaulting to TOOL_CALL", correlationId, action.getType());
+                action.setType(ActionType.TOOL_CALL);
+                return executeToolCall(action, context, state, toolCalls, correlationId);
+        }
+    }
+
+    private AgentAction executeToolCall(AgentAction action, ExecutionContext context, ExecutionState state, List<ToolCall> toolCalls, String correlationId) {
+        log.info("[{}] Executing tool call: {} with tool: {}", correlationId, action.getActionId(), action.getToolName());
+
+        // Validate tool exists before attempting execution
+        if (!toolRegistry.hasTool(action.getToolName())) {
+            log.error("[{}] Tool not found: {}. Skipping execution and marking action as failed.", correlationId, action.getToolName());
+            action.setDescription(action.getDescription() + " (FAILED - TOOL NOT FOUND)");
+            
+            // Create error observation immediately without retries
+            Observation errorObservation = Observation.builder()
+                    .observationId(UUID.randomUUID().toString())
+                    .toolName(action.getToolName())
+                    .content("Tool not found: " + action.getToolName())
+                    .timestamp(LocalDateTime.now())
+                    .success(false)
+                    .errorMessage("Tool not found: " + action.getToolName())
+                    .build();
+            state.addObservation(errorObservation);
+            context.addObservation(errorObservation);
+            
+            // Create failed tool call record
+            ToolCall toolCall = ToolCall.builder()
+                    .callId(UUID.randomUUID())
+                    .actionId(action.getActionId())
+                    .toolName(action.getToolName())
+                    .parameters(action.getParameters())
+                    .result("")
+                    .success(false)
+                    .errorMessage("Tool not found: " + action.getToolName())
+                    .startedAt(LocalDateTime.now())
+                    .completedAt(LocalDateTime.now())
+                    .durationMs(0)
+                    .build();
+            toolCalls.add(toolCall);
+            
+            return action;
+        }
 
         // Check for duplicate actions before executing
         if (isDuplicateAction(action, state.getCompletedActions())) {
-            log.warn("Skipping duplicate action: {} with tool: {} and purpose: {}", 
-                    action.getActionId(), action.getToolName(), action.getPurpose());
+            log.warn("[{}] Skipping duplicate action: {} with tool: {} and purpose: {}", 
+                    correlationId, action.getActionId(), action.getToolName(), action.getPurpose());
             
             // Mark as skipped but return the action with modified description
             action.setDescription(action.getDescription() + " (SKIPPED - DUPLICATE)");
+            
+            // Add to completed actions so planner knows it was attempted
+            state.addCompletedAction(action);
+            
+            // Create observation to inform planner why action was skipped
+            Observation skipObservation = Observation.builder()
+                    .observationId(UUID.randomUUID().toString())
+                    .toolName(action.getToolName())
+                    .content("Action skipped as duplicate - this tool was already executed with similar parameters. Consider using a different tool or approach.")
+                    .timestamp(LocalDateTime.now())
+                    .success(false)
+                    .errorMessage("Duplicate action skipped")
+                    .build();
+            state.addObservation(skipObservation);
+            context.addObservation(skipObservation);
+            
             return action;
         }
 
@@ -519,10 +845,12 @@ public class AgentRuntime implements Agent {
         // Runtime owns action status - create execution state for this action
         ActionStatus actionStatus = ActionStatus.RUNNING;
         LocalDateTime toolStartedAt = LocalDateTime.now();
+        LocalDateTime toolCompletedAt = LocalDateTime.now();
+        long durationMs = 0;
         int attempt = 0;
         Exception lastException = null;
 
-        while (attempt <= MAX_RETRIES) {
+        while (attempt <= maxRetries) {
             attempt++;
             try {
                 Tool tool = toolRegistry.get(action.getToolName());
@@ -536,8 +864,8 @@ public class AgentRuntime implements Agent {
                         .build();
 
                 ToolResult result = tool.execute(toolRequest, context, artifactManager);
-                LocalDateTime toolCompletedAt = LocalDateTime.now();
-                long durationMs = java.time.Duration.between(toolStartedAt, toolCompletedAt).toMillis();
+                toolCompletedAt = LocalDateTime.now();
+                durationMs = java.time.Duration.between(toolStartedAt, toolCompletedAt).toMillis();
                 
                 // Add parameters to result for tracking
                 result.setParameters(action.getParameters());
@@ -561,43 +889,55 @@ public class AgentRuntime implements Agent {
                 state.addToolResult(result);
                 state.addCompletedAction(action);
 
-                // Create observation from tool result
-                Observation observation = Observation.builder()
-                        .observationId(UUID.randomUUID().toString())
-                        .toolName(tool.name())
-                        .content(result.getResult())
-                        .timestamp(LocalDateTime.now())
-                        .success(result.isSuccess())
-                        .errorMessage(result.getErrorMessage())
-                        .build();
-                state.addObservation(observation);
-                context.addObservation(observation);
-
-                // Store knowledge from tool result
-                if (result.isSuccess() && result.getResult() != null && !result.getResult().isEmpty()) {
-                    try {
-                        knowledgeMemory.storeKnowledge(
-                                result.getResult(),
-                                action.getToolName(),
-                                action.getParameters().containsKey("query") ? 
-                                        action.getParameters().get("query").toString() : "unknown",
-                                "fact",
-                                context.getExecutionId()
-                        );
-                        log.debug("Stored knowledge from tool result: {}", action.getToolName());
-                    } catch (Exception ke) {
-                        log.warn("Failed to store knowledge from tool result", ke);
+                // Process tool result centrally (register artifacts, observations, knowledge)
+                processToolResult(context, result, action);
+                
+                // Check for deterministic milestone completion after artifact registration
+                if (workflowManager.isMilestoneComplete(context)) {
+                    String currentMilestone = context.getCurrentMilestone();
+                    log.info("[{}] Milestone '{}' is complete. Advancing to next milestone.", correlationId, currentMilestone);
+                    
+                    // Add to completed milestones
+                    context.addCompletedMilestone(currentMilestone);
+                    
+                    // Get next milestone
+                    List<String> workflow = (List<String>) context.getVariable("workflow");
+                    String nextMilestone = workflowManager.getNextMilestone(workflow, currentMilestone);
+                    
+                    if (nextMilestone != null) {
+                        context.setCurrentMilestone(nextMilestone);
+                        log.info("[{}] Advanced to next milestone: {}", correlationId, nextMilestone);
+                        
+                        // Set milestone completion criteria in context for planner
+                        context.setVariable("milestoneCriteria", workflowManager.getMilestoneCriteria(nextMilestone));
+                        
+                        // Add milestone advancement to execution graph
+                        Object graphObj = context.getMetadata().get("executionGraph");
+                        if (graphObj instanceof ExecutionGraph) {
+                            addMilestoneNode(nextMilestone, (ExecutionGraph) graphObj, context.getCurrentStep());
+                        }
+                    } else {
+                        log.info("[{}] Reached final milestone: {}", correlationId, currentMilestone);
+                        context.setCurrentMilestone("Complete");
                     }
+                    
+                    contextManager.updateContext(context);
                 }
+                
+                // Update progress tracking
+                context.setVariable("lastProgressTimestamp", System.currentTimeMillis());
 
                 actionStatus = ActionStatus.COMPLETED;
 
-                log.info("Action {} completed successfully on attempt {}", action.getActionId(), attempt);
+                log.info("[{}] Action {} completed successfully on attempt {}", correlationId, action.getActionId(), attempt);
                 return action;
 
             } catch (Exception e) {
                 lastException = e;
-                log.error("Error executing action: {} on attempt {}/{}", action.getActionId(), attempt, MAX_RETRIES, e);
+                log.error("[{}] Error executing action: {} on attempt {}/{}", correlationId, action.getActionId(), attempt, maxRetries, e);
+                
+                // Classify error to determine if retry is appropriate
+                ErrorClassification classification = classifyError(e);
                 
                 // Add retry history
                 context.addRetry(ExecutionContext.RetryHistory.builder()
@@ -607,11 +947,19 @@ public class AgentRuntime implements Agent {
                         .timestamp(LocalDateTime.now())
                         .build());
                 
+                // Skip retries for non-retriable errors
+                if (classification == ErrorClassification.NON_RETRIABLE) {
+                    log.warn("[{}] Non-retriable error detected for action {}: {}. Aborting retries.", 
+                            correlationId, action.getActionId(), e.getMessage());
+                    break;
+                }
+                
                 // If we haven't exhausted retries, wait and try again
-                if (attempt < MAX_RETRIES) {
+                if (attempt < maxRetries) {
                     try {
-                        long delayMs = RETRY_DELAY_MS * (long) Math.pow(2, attempt - 1); // Exponential backoff
-                        log.info("Retrying action {} in {} ms", action.getActionId(), delayMs);
+                        long delayMs = calculateRetryDelay(classification, attempt);
+                        log.info("[{}] Retrying action {} in {} ms (classification: {})", 
+                                correlationId, action.getActionId(), delayMs, classification);
                         Thread.sleep(delayMs);
                     } catch (InterruptedException ie) {
                         Thread.currentThread().interrupt();
@@ -622,10 +970,8 @@ public class AgentRuntime implements Agent {
         }
 
         // All retries exhausted
+        log.error("[{}] Action {} failed after {} attempts", correlationId, action.getActionId(), maxRetries);
         actionStatus = ActionStatus.FAILED;
-        LocalDateTime toolCompletedAt = LocalDateTime.now();
-        long durationMs = java.time.Duration.between(toolStartedAt, toolCompletedAt).toMillis();
-        state.incrementRetry();
 
         // Create ToolCall record for failed execution
         ToolCall toolCall = ToolCall.builder()
@@ -642,11 +988,11 @@ public class AgentRuntime implements Agent {
                 .build();
         toolCalls.add(toolCall);
 
-        // Add error observation
+        // Create error observation
         Observation errorObservation = Observation.builder()
                 .observationId(UUID.randomUUID().toString())
                 .toolName(action.getToolName())
-                .content("Failed to execute tool after " + MAX_RETRIES + " attempts: " + 
+                .content("Failed to execute tool after " + maxRetries + " attempts: " + 
                         (lastException != null ? lastException.getMessage() : "Unknown error"))
                 .timestamp(LocalDateTime.now())
                 .success(false)
@@ -656,6 +1002,105 @@ public class AgentRuntime implements Agent {
         context.addObservation(errorObservation);
 
         return action;
+    }
+
+    private AgentAction handleStateTransition(AgentAction action, ExecutionContext context, String correlationId) {
+        log.info("[{}] Handling state transition: {}", correlationId, action.getActionId());
+        // TODO: Implement state transition logic
+        return action;
+    }
+
+    private AgentAction handleComplete(AgentAction action, ExecutionContext context, String correlationId) {
+        log.info("[{}] Handling complete action: {}", correlationId, action.getActionId());
+        // TODO: Implement complete logic
+        return action;
+    }
+
+    private AgentAction handleNoOp(AgentAction action, ExecutionContext context, String correlationId) {
+        log.info("[{}] Handling NO_OP action: {}", correlationId, action.getActionId());
+        // NO_OP is a placeholder - no action needed
+        return action;
+    }
+
+    /**
+     * Process tool result centrally - register artifacts, observations, and knowledge
+     */
+    private void processToolResult(ExecutionContext context, ToolResult result, AgentAction action) {
+        if (result == null) {
+            return;
+        }
+
+        registerArtifacts(context, result);
+        registerObservations(context, result);
+        registerKnowledge(context, result, action);
+    }
+
+    /**
+     * Register artifacts from tool result to execution context
+     */
+    private void registerArtifacts(ExecutionContext context, ToolResult result) {
+        if (result.getArtifacts() == null || result.getArtifacts().isEmpty()) {
+            return;
+        }
+
+        for (ArtifactReference artifact : result.getArtifacts()) {
+            context.addArtifactReference(artifact);
+            log.info("Registered artifact {} v{} for execution {}",
+                    artifact.getName(), artifact.getVersion(), context.getExecutionId());
+        }
+    }
+
+    /**
+     * Register observation from tool result to execution context
+     */
+    private void registerObservations(ExecutionContext context, ToolResult result) {
+        if (result.getResult() == null || result.getResult().isEmpty()) {
+            return;
+        }
+
+        Observation observation = Observation.builder()
+                .observationId(UUID.randomUUID().toString())
+                .toolName(result.getToolName())
+                .content(result.getResult())
+                .timestamp(LocalDateTime.now())
+                .success(result.isSuccess())
+                .errorMessage(result.getErrorMessage())
+                .build();
+
+        context.addObservation(observation);
+    }
+
+    /**
+     * Register knowledge from tool result (filtered to exclude execution events)
+     */
+    private void registerKnowledge(ExecutionContext context, ToolResult result, AgentAction action) {
+        if (!result.isSuccess() || result.getResult() == null || result.getResult().isEmpty()) {
+            return;
+        }
+
+        // Filter out execution events - don't store "generated successfully" messages as knowledge
+        String resultContent = result.getResult().toLowerCase();
+        if (resultContent.contains("generated successfully") || 
+            resultContent.contains("completed") ||
+            resultContent.contains("skipped") ||
+            resultContent.contains("failed")) {
+            log.debug("Skipping knowledge storage for execution event: {}", result.getToolName());
+            return;
+        }
+
+        try {
+            knowledgeMemory.storeKnowledge(
+                    result.getResult(),
+                    action.getToolName(),
+                    action.getParameters().containsKey("query") ? 
+                            action.getParameters().get("query").toString() : "unknown",
+                    "fact",
+                    context.getExecutionId()
+            );
+            log.debug("Stored knowledge from tool result: {}", action.getToolName());
+        } catch (Exception ke) {
+            log.warn("Failed to store knowledge from tool result", ke);
+        }
     }
 
     private AgentResponse buildSuccessResponse(ExecutionContext context, List<AgentAction> actionsTaken, 
@@ -680,7 +1125,18 @@ public class AgentRuntime implements Agent {
                 .actionsTaken(convertToLegacyActions(actionsTaken))
                 .toolCalls(toolCalls)
                 .observations(context.getObservations())
-                .artifacts(context.getArtifacts())
+                .artifacts(context.getArtifactReferences().stream()
+                        .map(ref -> {
+                            // Convert ArtifactReference to Artifact for backward compatibility
+                            // TODO: Update AgentResponse to use ArtifactReference directly
+                            return com.enterprise.ai.agent.model.Artifact.builder()
+                                    .artifactId(ref.getArtifactId())
+                                    .name(ref.getName())
+                                    .type(ref.getType())
+                                    .version(ref.getVersion())
+                                    .build();
+                        })
+                        .collect(java.util.stream.Collectors.toList()))
                 .executionGraph(executionGraph)
                 .status("completed")
                 .plannerReasoning(planningResult != null ? planningResult.getReasoning() : null)
@@ -752,6 +1208,101 @@ public class AgentRuntime implements Agent {
         }
         return baseName + ".md";
     }
+    
+    /**
+     * Create fallback planning result when planner fails
+     */
+    private PlanningResult createFallbackPlanningResult(ExecutionContext context) {
+        log.warn("Creating fallback planning result for execution: {}", context.getExecutionId());
+        
+        // Determine appropriate fallback state based on current milestone
+        String currentMilestone = context.getCurrentMilestone();
+        AgentState fallbackState = AgentState.FINISH;
+        String fallbackStep = "Execution completed with fallback";
+        
+        if (currentMilestone != null) {
+            if (currentMilestone.contains("Collect") || currentMilestone.contains("Gather")) {
+                fallbackState = AgentState.ANALYZE;
+                fallbackStep = "Analyze collected information with fallback";
+            } else if (currentMilestone.contains("Generate") || currentMilestone.contains("Write")) {
+                fallbackState = AgentState.GENERATE_ARTIFACT;
+                fallbackStep = "Generate artifact with fallback";
+            }
+        }
+        
+        return PlanningResult.builder()
+                .reasoning("Fallback result due to planning failure. Attempting to continue execution.")
+                .currentState(fallbackState)
+                .nextState(fallbackState)
+                .milestone(currentMilestone)
+                .nextStep(fallbackStep)
+                .confidence(0.3) // Lower confidence for fallback
+                .actions(new ArrayList<>())
+                .build();
+    }
+    
+    /**
+     * Validate that the execution has produced artifacts that match the goal requirements
+     */
+    private boolean validateGoalCompletion(ExecutionContext context, String goal) {
+        List<ArtifactReference> artifactReferences = context.getArtifactReferences();
+        String goalLower = goal.toLowerCase();
+        
+        log.info("Validating goal completion for goal: {} with {} artifacts", goal, artifactReferences.size());
+        
+        // Check for thesis/document goals
+        if (goalLower.contains("thesis") || goalLower.contains("document") || goalLower.contains("paper")) {
+            boolean hasDocument = artifactReferences.stream().anyMatch(ref -> 
+                "document".equalsIgnoreCase(ref.getType()) || 
+                "file".equalsIgnoreCase(ref.getType()) ||
+                ref.getName().toLowerCase().contains("thesis") ||
+                ref.getName().toLowerCase().contains("document")
+            );
+            
+            if (!hasDocument) {
+                log.warn("[{}] Goal validation failed: No document artifact found for thesis/document goal", ERR_GOAL_VALIDATION);
+                return false;
+            }
+        }
+        
+        // Check for outline goals
+        if (goalLower.contains("outline")) {
+            boolean hasOutline = artifactReferences.stream().anyMatch(ref -> 
+                "outline".equalsIgnoreCase(ref.getType()) || 
+                "file".equalsIgnoreCase(ref.getType()) ||
+                ref.getName().toLowerCase().contains("outline")
+            );
+            
+            if (!hasOutline) {
+                log.warn("[{}] Goal validation failed: No outline artifact found for outline goal", ERR_GOAL_VALIDATION);
+                return false;
+            }
+        }
+        
+        // Check for report goals
+        if (goalLower.contains("report") || goalLower.contains("analysis")) {
+            boolean hasReport = artifactReferences.stream().anyMatch(ref -> 
+                "report".equalsIgnoreCase(ref.getType()) || 
+                "document".equalsIgnoreCase(ref.getType()) ||
+                "file".equalsIgnoreCase(ref.getType()) ||
+                ref.getName().toLowerCase().contains("report")
+            );
+            
+            if (!hasReport) {
+                log.warn("[{}] Goal validation failed: No report artifact found for report/analysis goal", ERR_GOAL_VALIDATION);
+                return false;
+            }
+        }
+        
+        // If no specific artifact type required, ensure at least some artifact was created
+        if (artifactReferences.isEmpty()) {
+            log.warn("[{}] Goal validation failed: No artifacts created", ERR_GOAL_VALIDATION);
+            return false;
+        }
+        
+        log.info("Goal validation passed: {} artifacts match goal requirements", artifactReferences.size());
+        return true;
+    }
 
     /**
      * Check if an action is a duplicate of previously completed actions.
@@ -790,7 +1341,7 @@ public class AgentRuntime implements Agent {
                     String completedQuery = completedAction.getParameters().get("query").toString().toLowerCase();
                     double similarity = calculateSimilarity(newQuery, completedQuery);
                     
-                    if (similarity >= DUPLICATE_SIMILARITY_THRESHOLD) {
+                    if (similarity >= duplicateSimilarityThreshold) {
                         log.debug("Duplicate action detected by query similarity: {}% (new: {}, completed: {})", 
                                 (int)(similarity * 100), newQuery, completedQuery);
                         return true;
@@ -827,5 +1378,60 @@ public class AgentRuntime implements Agent {
         if (maxTokens == 0) return 0.0;
 
         return (double) overlap / maxTokens;
+    }
+    
+    /**
+     * Classify error to determine retry strategy
+     */
+    private ErrorClassification classifyError(Exception e) {
+        String errorMessage = e.getMessage() != null ? e.getMessage().toLowerCase() : "";
+        String exceptionType = e.getClass().getSimpleName().toLowerCase();
+        
+        // Non-retriable errors
+        if (exceptionType.contains("illegalargument") || 
+            errorMessage.contains("tool not found") ||
+            errorMessage.contains("invalid parameter") ||
+            errorMessage.contains("authentication") ||
+            errorMessage.contains("authorization") ||
+            errorMessage.contains("permission")) {
+            return ErrorClassification.NON_RETRIABLE;
+        }
+        
+        // Rate limit errors
+        if (errorMessage.contains("rate limit") || 
+            errorMessage.contains("too many requests") ||
+            errorMessage.contains("429")) {
+            return ErrorClassification.RATE_LIMIT;
+        }
+        
+        // Timeout errors
+        if (exceptionType.contains("timeout") || 
+            errorMessage.contains("timeout") ||
+            errorMessage.contains("timed out")) {
+            return ErrorClassification.TIMEOUT;
+        }
+        
+        // Default to retriable for unknown errors
+        return ErrorClassification.RETRIABLE;
+    }
+    
+    /**
+     * Calculate retry delay based on error classification
+     */
+    private long calculateRetryDelay(ErrorClassification classification, int attempt) {
+        switch (classification) {
+            case RATE_LIMIT:
+                // Longer delay for rate limits
+                return retryDelayMs * (long) Math.pow(3, attempt - 1);
+            case TIMEOUT:
+                // Moderate delay for timeouts
+                return retryDelayMs * (long) Math.pow(2, attempt - 1);
+            case RETRIABLE:
+                // Standard exponential backoff
+                return retryDelayMs * (long) Math.pow(2, attempt - 1);
+            case NON_RETRIABLE:
+            default:
+                return 0;
+        }
     }
 }

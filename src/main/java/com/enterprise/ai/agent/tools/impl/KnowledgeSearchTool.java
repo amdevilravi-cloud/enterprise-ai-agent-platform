@@ -19,6 +19,15 @@ public class KnowledgeSearchTool implements Tool {
 
     private final RestTemplate restTemplate;
     private final String knowledgePlatformUrl;
+    private final Map<String, CachedResult> resultCache = new java.util.concurrent.ConcurrentHashMap<>();
+    
+    @Value("${knowledge.search.cache.expiry.ms:60000}")
+    private long cacheExpiryMs;
+    
+    @Value("${knowledge.search.max.cache.size:50}")
+    private int maxCacheSize;
+
+    @SuppressWarnings("unchecked")
 
     public KnowledgeSearchTool(RestTemplate restTemplate, 
                               @Value("${knowledge.platform.url:http://localhost:8080}") String knowledgePlatformUrl) {
@@ -70,6 +79,20 @@ public class KnowledgeSearchTool implements Tool {
                         .build();
             }
 
+            // Check cache first
+            String normalizedQuery = query.trim().toLowerCase();
+            CachedResult cached = resultCache.get(normalizedQuery);
+            if (cached != null && !cached.isExpired()) {
+                log.info("Cache hit for query: '{}', returning cached result", query);
+                return ToolResult.builder()
+                        .toolName(name())
+                        .success(true)
+                        .result(cached.result)
+                        .data(cached.data)
+                        .durationMs(System.currentTimeMillis() - startTime)
+                        .build();
+            }
+
             // Call knowledge platform RAG API
             String url = knowledgePlatformUrl + "/api/chat/rag?message=" + query;
             Map<String, Object> response = restTemplate.getForObject(url, Map.class);
@@ -89,6 +112,9 @@ public class KnowledgeSearchTool implements Tool {
                 data.put("answer", answer);
                 data.put("isFromContext", isFromContext);
                 data.put("retrievalCount", retrievalCount);
+
+                // Cache the result
+                cacheResult(normalizedQuery, answer, data);
 
                 return ToolResult.builder()
                         .toolName(name())
@@ -116,6 +142,42 @@ public class KnowledgeSearchTool implements Tool {
                     .errorMessage(e.getMessage())
                     .durationMs(System.currentTimeMillis() - startTime)
                     .build();
+        }
+    }
+    
+    /**
+     * Cache a search result
+     */
+    private void cacheResult(String query, String result, Map<String, Object> data) {
+        // Clean up old cache entries if at capacity
+        if (resultCache.size() >= maxCacheSize) {
+            resultCache.entrySet().removeIf(entry -> entry.getValue().isExpired());
+            if (resultCache.size() >= maxCacheSize) {
+                // Remove oldest entry if still at capacity
+                resultCache.keySet().stream().findFirst().ifPresent(resultCache::remove);
+            }
+        }
+        
+        resultCache.put(query, new CachedResult(result, data, System.currentTimeMillis()));
+        log.debug("Cached result for query: '{}'", query);
+    }
+    
+    /**
+     * Inner class for cached results with expiry
+     */
+    private class CachedResult {
+        final String result;
+        final Map<String, Object> data;
+        final long timestamp;
+        
+        CachedResult(String result, Map<String, Object> data, long timestamp) {
+            this.result = result;
+            this.data = data;
+            this.timestamp = timestamp;
+        }
+        
+        boolean isExpired() {
+            return System.currentTimeMillis() - timestamp > cacheExpiryMs;
         }
     }
 }

@@ -5,6 +5,8 @@ import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 
 @Data
@@ -26,4 +28,7 @@ public class ToolResult {
     private String errorMessage;
 
     private long durationMs;
+
+    @Builder.Default
+    private List<ArtifactReference> artifacts = new ArrayList<>();
 }

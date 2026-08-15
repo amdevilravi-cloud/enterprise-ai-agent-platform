@@ -19,17 +19,48 @@ public class ArtifactManagerImpl implements ArtifactManager {
     
     private final Map<UUID, Artifact> artifacts = new ConcurrentHashMap<>();
     private final Map<UUID, List<UUID>> executionArtifacts = new ConcurrentHashMap<>();
+    private final Map<String, UUID> artifactIdentityMap = new ConcurrentHashMap<>(); // Maps logical identity to latest artifact ID
     
     @Override
     public Artifact createArtifact(String type, String name, String content, String mimeType, 
                                    String createdBy, UUID relatedExecutionId) {
-        return createArtifact(type, name, content, mimeType, createdBy, relatedExecutionId, 1, null);
+        return createArtifact(type, name, content, mimeType, createdBy, relatedExecutionId, 1, null, null);
     }
     
     @Override
     public Artifact createArtifact(String type, String name, String content, String mimeType, 
                                    String createdBy, UUID relatedExecutionId, int version, UUID parentArtifactId) {
+        return createArtifact(type, name, content, mimeType, createdBy, relatedExecutionId, version, parentArtifactId, null);
+    }
+    
+    /**
+     * Create artifact with logical identity support
+     * @param artifactKey Optional logical identity key (e.g., "analysis", "outline", "document")
+     */
+    public Artifact createArtifact(String type, String name, String content, String mimeType, 
+                                   String createdBy, UUID relatedExecutionId, int version, UUID parentArtifactId, String artifactKey) {
         UUID artifactId = UUID.randomUUID();
+        
+        // If artifactKey is provided, check if logical identity already exists
+        if (artifactKey != null && !artifactKey.isEmpty()) {
+            String logicalIdentity = relatedExecutionId + "_" + artifactKey;
+            UUID existingArtifactId = artifactIdentityMap.get(logicalIdentity);
+            
+            if (existingArtifactId != null) {
+                // Logical identity exists, create new version
+                Artifact existingArtifact = artifacts.get(existingArtifactId);
+                if (existingArtifact != null) {
+                    version = existingArtifact.getVersion() + 1;
+                    parentArtifactId = existingArtifact.getArtifactId();
+                    log.info("Logical identity '{}' exists. Creating version {} instead of {}", 
+                            logicalIdentity, version, version - 1);
+                }
+            }
+            
+            // Update identity map with new artifact ID
+            artifactIdentityMap.put(logicalIdentity, artifactId);
+        }
+        
         Artifact artifact = Artifact.builder()
                 .artifactId(artifactId)
                 .version(version)
@@ -50,8 +81,9 @@ public class ArtifactManagerImpl implements ArtifactManager {
         executionArtifacts.computeIfAbsent(relatedExecutionId, k -> new ArrayList<>()).add(artifactId);
         
         String lineageInfo = parentArtifactId != null ? " (parent: " + parentArtifactId + ")" : "";
-        log.info("Created artifact: id={}, version={}, type={}, name={}, executionId={}{}", 
-                artifactId, version, type, name, relatedExecutionId, lineageInfo);
+        String keyInfo = artifactKey != null ? " (key: " + artifactKey + ")" : "";
+        log.info("Created artifact: id={}, version={}, type={}, name={}, executionId={}{}{}", 
+                artifactId, version, type, name, relatedExecutionId, lineageInfo, keyInfo);
         
         return artifact;
     }

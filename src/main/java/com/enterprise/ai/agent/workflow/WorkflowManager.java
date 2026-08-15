@@ -1,12 +1,15 @@
 package com.enterprise.ai.agent.workflow;
 
-import com.enterprise.ai.agent.model.Artifact;
+import com.enterprise.ai.agent.agent_runtime.ExecutionContext;
+import com.enterprise.ai.agent.model.ArtifactReference;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * WorkflowManager - Owns the workflow definition and milestone progression.
@@ -16,6 +19,57 @@ import java.util.List;
 @Slf4j
 public class WorkflowManager {
 
+    // Pre-defined workflows for different task types
+    
+    // Milestone-to-tool mappings: defines which tools are appropriate for each milestone
+    private static final Map<String, List<String>> MILESTONE_TOOLS = new HashMap<>();
+    
+    static {
+        // Information gathering milestones
+        MILESTONE_TOOLS.put("Collect Information", Arrays.asList("knowledge_search"));
+        MILESTONE_TOOLS.put("Collect Overview", Arrays.asList("knowledge_search"));
+        MILESTONE_TOOLS.put("Gather Detailed Information", Arrays.asList("knowledge_search"));
+        MILESTONE_TOOLS.put("Collect Data", Arrays.asList("knowledge_search"));
+        
+        // Analysis milestones
+        MILESTONE_TOOLS.put("Analyze Information", Arrays.asList("document_generator", "knowledge_search"));
+        MILESTONE_TOOLS.put("Analyze Findings", Arrays.asList("document_generator", "knowledge_search"));
+        MILESTONE_TOOLS.put("Analyze Data", Arrays.asList("document_generator", "knowledge_search"));
+        
+        // Outline/insight milestones
+        MILESTONE_TOOLS.put("Generate Outline", Arrays.asList("document_generator"));
+        MILESTONE_TOOLS.put("Synthesize Research", Arrays.asList("document_generator"));
+        MILESTONE_TOOLS.put("Generate Insights", Arrays.asList("document_generator"));
+        
+        // Document creation milestones
+        MILESTONE_TOOLS.put("Write Document", Arrays.asList("document_generator"));
+        MILESTONE_TOOLS.put("Create Report", Arrays.asList("document_generator"));
+        
+        // Review milestones
+        MILESTONE_TOOLS.put("Review Document", Arrays.asList("document_generator"));
+    }
+    
+    // Tool schemas: defines input/output contracts for each tool
+    private static final Map<String, ToolSchema> TOOL_SCHEMAS = new HashMap<>();
+    
+    static {
+        TOOL_SCHEMAS.put("knowledge_search", ToolSchema.builder()
+                .name("knowledge_search")
+                .description("Search for information from knowledge base")
+                .addParameter("query", "string", true)
+                .produces("knowledge")
+                .build());
+        
+        TOOL_SCHEMAS.put("document_generator", ToolSchema.builder()
+                .name("document_generator")
+                .description("Generate documents, analysis, outlines, or reports")
+                .addParameter("content", "string", true)
+                .addParameter("documentType", "string", false)
+                .addParameter("instructions", "string", false)
+                .produces("document")
+                .build());
+    }
+    
     // Pre-defined workflows for different task types
     private static final List<String> DOCUMENT_CREATION_WORKFLOW = Arrays.asList(
             "Collect Information",
@@ -98,8 +152,8 @@ public class WorkflowManager {
             case "Collect Overview":
             case "Gather Detailed Information":
             case "Collect Data":
-                // Information gathering milestones: need 2-3 successful knowledge searches
-                return knowledgeSearchCount >= 2;
+                // Information gathering milestones: need 1 successful knowledge search
+                return knowledgeSearchCount >= 1;
                 
             case "Analyze Information":
             case "Analyze Findings":
@@ -132,32 +186,129 @@ public class WorkflowManager {
                 return completedActions >= 1;
         }
     }
+
+    /**
+     * Check if the current milestone is complete based on ExecutionContext.
+     * This is the preferred method that uses artifact references for validation.
+     */
+    public boolean isMilestoneComplete(ExecutionContext context) {
+        String currentMilestone = context.getCurrentMilestone();
+        if (currentMilestone == null || currentMilestone.isEmpty()) {
+            return false;
+        }
+
+        int completedActions = context.getToolResults().size();
+        int knowledgeSearchCount = (int) context.getToolResults().stream()
+                .filter(tr -> "knowledge_search".equals(tr.getToolName()))
+                .count();
+        int artifactCount = context.getArtifactReferences().size();
+
+        return isMilestoneComplete(currentMilestone, completedActions, knowledgeSearchCount, artifactCount) &&
+               hasRequiredArtifactType(currentMilestone, context.getArtifactReferences());
+    }
     
     /**
      * Check if milestone has required artifact type
      * This should be called after isMilestoneComplete to validate artifact types
+     * Updated to be more deterministic based on artifact keys
      */
-    public boolean hasRequiredArtifactType(String milestone, List<Artifact> artifacts) {
-        if (artifacts == null || artifacts.isEmpty()) {
+    public boolean hasRequiredArtifactType(String milestone, List<ArtifactReference> artifactReferences) {
+        if (artifactReferences == null || artifactReferences.isEmpty()) {
+            // For information gathering milestones, no artifacts is acceptable
+            return isInformationGatheringMilestone(milestone);
+        }
+        
+        // Get required artifact key for this milestone
+        String requiredArtifactKey = getRequiredArtifactKey(milestone);
+        if (requiredArtifactKey == null) {
+            // No specific artifact requirement
+            return true;
+        }
+        
+        // Check if we have an artifact with the required key
+        return artifactReferences.stream().anyMatch(ref -> 
+            requiredArtifactKey.equalsIgnoreCase(ref.getArtifactKey()) ||
+            ref.getName().toLowerCase().contains(requiredArtifactKey.toLowerCase()));
+    }
+    
+    /**
+     * Get the required artifact key for a milestone
+     */
+    private String getRequiredArtifactKey(String milestone) {
+        if (milestone == null) {
+            return null;
+        }
+        
+        // Map milestones to their required artifact keys
+        if (milestone.contains("Collect") || milestone.contains("Gather")) {
+            return null; // Information gathering doesn't require specific artifacts
+        }
+        if (milestone.contains("Analyze")) {
+            return "analysis";
+        }
+        if (milestone.contains("Outline") || milestone.contains("Synthesize")) {
+            return "outline";
+        }
+        if (milestone.contains("Write") || milestone.contains("Document") || milestone.contains("Report")) {
+            return "document";
+        }
+        if (milestone.contains("Review")) {
+            return "document"; // Review requires a document to review
+        }
+        
+        return null;
+    }
+    
+    /**
+     * Check if a milestone is an information gathering milestone
+     */
+    public boolean isInformationGatheringMilestone(String milestone) {
+        if (milestone == null) {
             return false;
         }
         
-        switch (milestone) {
-            case "Generate Outline":
-            case "Synthesize Research":
-            case "Generate Insights":
-                // Must have at least 1 outline artifact
-                return artifacts.stream().anyMatch(a -> "outline".equalsIgnoreCase(a.getType()));
-                
-            case "Write Document":
-            case "Create Report":
-                // Must have at least 1 document artifact
-                return artifacts.stream().anyMatch(a -> "document".equalsIgnoreCase(a.getType()));
-                
-            default:
-                // No specific artifact type requirement
-                return true;
+        return milestone.toLowerCase().contains("collect") || 
+               milestone.toLowerCase().contains("gather") ||
+               milestone.toLowerCase().contains("information");
+    }
+
+    /**
+     * Get recommended tools for a given milestone
+     */
+    public List<String> getToolsForMilestone(String milestone) {
+        if (milestone == null) {
+            return new ArrayList<>();
         }
+        
+        // Try exact match first
+        List<String> tools = MILESTONE_TOOLS.get(milestone);
+        if (tools != null) {
+            return tools;
+        }
+        
+        // Try partial match
+        for (Map.Entry<String, List<String>> entry : MILESTONE_TOOLS.entrySet()) {
+            if (milestone.toLowerCase().contains(entry.getKey().toLowerCase()) ||
+                entry.getKey().toLowerCase().contains(milestone.toLowerCase())) {
+                return entry.getValue();
+            }
+        }
+        
+        return new ArrayList<>();
+    }
+
+    /**
+     * Get tool schema for a specific tool
+     */
+    public ToolSchema getToolSchema(String toolName) {
+        return TOOL_SCHEMAS.get(toolName);
+    }
+
+    /**
+     * Get all available tool schemas
+     */
+    public Map<String, ToolSchema> getAllToolSchemas() {
+        return new HashMap<>(TOOL_SCHEMAS);
     }
 
     /**
@@ -169,7 +320,7 @@ public class WorkflowManager {
             case "Collect Overview":
             case "Gather Detailed Information":
             case "Collect Data":
-                return "Complete 2-3 knowledge searches to gather relevant information";
+                return "Complete 1 knowledge search to gather relevant information";
                 
             case "Analyze Information":
             case "Analyze Findings":

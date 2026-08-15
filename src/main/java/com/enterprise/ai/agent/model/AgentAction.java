@@ -19,6 +19,7 @@ import java.util.UUID;
 @AllArgsConstructor
 public class AgentAction {
     private UUID actionId;
+    private ActionType type;  // Type of action (TOOL_CALL, STATE_TRANSITION, COMPLETE, NO_OP)
     private String toolName;
     private String description;
     private String purpose; // Purpose of this action (e.g., "Collect overview", "Analyze findings")
