@@ -9,9 +9,9 @@ import java.util.List;
 
 /**
  * PlanningResult - Produced only by the planner.
- * Contains the reasoning, current state, next state, milestone, next step, confidence, and list of actions.
+ * Contains the reasoning, next state, milestone, next step, confidence, and list of actions.
  * The planner is stateless and does not own execution state.
- * The runtime owns action status, execution metadata, and lifecycle management.
+ * The runtime owns current state and all execution metadata.
  */
 @Data
 @Builder(toBuilder = true)
@@ -19,7 +19,6 @@ import java.util.List;
 @AllArgsConstructor
 public class PlanningResult {
     private String reasoning;
-    private AgentState currentState;
     private AgentState nextState;
     private String milestone;
     private String nextStep;

@@ -31,4 +31,6 @@ public class ToolResult {
 
     @Builder.Default
     private List<ArtifactReference> artifacts = new ArrayList<>();
+    
+    private ToolOutcome outcome; // P1: Structured outcome for workflow decision making
 }

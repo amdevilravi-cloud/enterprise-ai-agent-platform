@@ -24,6 +24,7 @@ public class Execution {
     private String goal;
     private ExecutionState state;
     private ExecutionGraph executionGraph;
+    private String status;
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;
     private LocalDateTime completedAt;

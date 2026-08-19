@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <springProfile name="dev, default">
+        <!-- Console Appender with Text Format for Development -->
+        <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+            <encoder>
+                <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} [%X{correlationId}] - %msg%n</pattern>
+            </encoder>
+        </appender>
+
+        <!-- File Appender with Text Format for Development -->
+        <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+            <file>logs/agent-platform.log</file>
+            <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+                <fileNamePattern>logs/agent-platform.%d{yyyy-MM-dd}.log</fileNamePattern>
+                <maxHistory>30</maxHistory>
+                <totalSizeCap>1GB</totalSizeCap>
+            </rollingPolicy>
+            <encoder>
+                <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} [%X{correlationId}] - %msg%n</pattern>
+            </encoder>
+        </appender>
+
+        <!-- Async Appender for performance -->
+        <appender name="ASYNC_FILE" class="ch.qos.logback.classic.AsyncAppender">
+            <queueSize>512</queueSize>
+            <discardingThreshold>0</discardingThreshold>
+            <appender-ref ref="FILE" />
+        </appender>
+
+        <root level="INFO">
+            <appender-ref ref="CONSOLE" />
+            <appender-ref ref="ASYNC_FILE" />
+        </root>
+
+        <!-- Application-specific log levels -->
+        <logger name="com.enterprise.ai.agent" level="DEBUG" />
+        <logger name="org.springframework.web" level="INFO" />
+        <logger name="org.springframework.ai" level="DEBUG" />
+        <logger name="org.hibernate.SQL" level="INFO" />
+    </springProfile>
+
+    <springProfile name="prod">
+        <!-- Console Appender with Text Format for Production -->
+        <appender name="CONSOLE_PROD" class="ch.qos.logback.core.ConsoleAppender">
+            <encoder>
+                <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} [%X{correlationId}] - %msg%n</pattern>
+            </encoder>
+        </appender>
+
+        <!-- File Appender with Text Format for Production -->
+        <appender name="FILE_PROD" class="ch.qos.logback.core.rolling.RollingFileAppender">
+            <file>logs/agent-platform-prod.log</file>
+            <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
+                <fileNamePattern>logs/agent-platform-prod.%d{yyyy-MM-dd}.log</fileNamePattern>
+                <maxHistory>30</maxHistory>
+                <totalSizeCap>1GB</totalSizeCap>
+            </rollingPolicy>
+            <encoder>
+                <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} [%X{correlationId}] - %msg%n</pattern>
+            </encoder>
+        </appender>
+
+        <!-- Async Appender for performance -->
+        <appender name="ASYNC_FILE_PROD" class="ch.qos.logback.classic.AsyncAppender">
+            <queueSize>512</queueSize>
+            <discardingThreshold>0</discardingThreshold>
+            <appender-ref ref="FILE_PROD" />
+        </appender>
+
+        <root level="INFO">
+            <appender-ref ref="CONSOLE_PROD" />
+            <appender-ref ref="ASYNC_FILE_PROD" />
+        </root>
+
+        <!-- Application-specific log levels for production -->
+        <logger name="com.enterprise.ai.agent" level="INFO" />
+        <logger name="org.springframework.web" level="WARN" />
+        <logger name="org.springframework.ai" level="INFO" />
+        <logger name="org.hibernate.SQL" level="WARN" />
+    </springProfile>
+</configuration>

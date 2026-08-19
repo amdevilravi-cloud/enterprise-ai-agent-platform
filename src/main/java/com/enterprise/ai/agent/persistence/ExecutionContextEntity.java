@@ -61,6 +61,18 @@ public class ExecutionContextEntity {
     @Column(columnDefinition = "TEXT")
     private String metadata; // JSON object
     
+    @Column(columnDefinition = "TEXT")
+    private String plan; // JSON object (AgentPlan)
+    
+    @Column(columnDefinition = "TEXT")
+    private String reviews; // JSON array
+    
+    @Column(columnDefinition = "TEXT")
+    private String failures; // JSON array
+    
+    @Column(columnDefinition = "TEXT")
+    private String outputs; // JSON array
+    
     @Column(nullable = false)
     private LocalDateTime createdAt;
     

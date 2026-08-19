@@ -26,6 +26,7 @@ public class AgentResponse {
     private String answer;
     private boolean completed;
     private String status;
+    private ExecutionStatus executionStatus;
     private String errorMessage;
 
     // Planner output

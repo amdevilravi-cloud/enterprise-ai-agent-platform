@@ -1,7 +1,9 @@
 package com.enterprise.ai.agent.agent_runtime;
 
 import com.enterprise.ai.agent.model.AgentPlan;
+import com.enterprise.ai.agent.model.AgentState;
 import com.enterprise.ai.agent.model.ArtifactReference;
+import com.enterprise.ai.agent.model.KnowledgeGap;
 import com.enterprise.ai.agent.model.Observation;
 import com.enterprise.ai.agent.model.ToolResult;
 import lombok.AllArgsConstructor;
@@ -12,7 +14,6 @@ import lombok.extern.slf4j.Slf4j;
 
 import java.time.LocalDateTime;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -28,7 +29,16 @@ public class ExecutionContext {
     private UUID executionId;
     private String goal;
     private AgentPlan plan;
+    private AgentState currentState;
     private int currentStep;
+    private int iteration;
+    private int toolExecutionCount;
+    private int knowledgeSearchCount;
+    private int stateTransitionCount;
+    private int consecutiveNoProgress;
+    private LocalDateTime lastProgressTimestamp;
+    private ProgressType lastProgressType;
+    private int progressCount;
     private String currentMilestone;
     private List<String> completedMilestones;
     private List<Observation> observations;
@@ -39,6 +49,7 @@ public class ExecutionContext {
     private List<String> outputs;  // General outputs
     private Map<String, Object> variables;
     private List<String> knowledgeReferences;
+    private List<KnowledgeGap> knowledgeGaps;
     private List<RetryHistory> retryHistory;
     private Map<String, Object> metadata;
     private LocalDateTime createdAt;
@@ -65,7 +76,15 @@ public class ExecutionContext {
         return ExecutionContext.builder()
                 .executionId(executionId)
                 .goal(goal)
+                .currentState(AgentState.PLAN)
                 .currentStep(0)
+                .iteration(0)
+                .toolExecutionCount(0)
+                .knowledgeSearchCount(0)
+                .stateTransitionCount(0)
+                .consecutiveNoProgress(0)
+                .lastProgressTimestamp(LocalDateTime.now())
+                .progressCount(0)
                 .currentMilestone("")
                 .completedMilestones(new ArrayList<>())
                 .observations(new ArrayList<>())
@@ -76,6 +95,7 @@ public class ExecutionContext {
                 .outputs(new ArrayList<>())
                 .variables(new HashMap<>())
                 .knowledgeReferences(new ArrayList<>())
+                .knowledgeGaps(new ArrayList<>())
                 .retryHistory(new ArrayList<>())
                 .metadata(new HashMap<>())
                 .createdAt(LocalDateTime.now())
@@ -130,6 +150,16 @@ public class ExecutionContext {
         }
         this.updatedAt = LocalDateTime.now();
         log.debug("Added knowledge reference to context {}: {}", executionId, reference);
+    }
+    
+    public void addKnowledgeGap(KnowledgeGap gap) {
+        this.knowledgeGaps.add(gap);
+        this.updatedAt = LocalDateTime.now();
+        log.debug("Added knowledge gap to context {}: topic={}, status={}", executionId, gap.getTopic(), gap.getStatus());
+    }
+    
+    public List<KnowledgeGap> getKnowledgeGaps() {
+        return this.knowledgeGaps;
     }
 
     public void addArtifactReference(ArtifactReference reference) {
@@ -193,69 +223,67 @@ public class ExecutionContext {
         log.debug("Incremented step in context {}: now at step {}", executionId, currentStep);
     }
 
+    public void incrementIteration() {
+        this.iteration++;
+        this.updatedAt = LocalDateTime.now();
+        log.debug("Incremented iteration in context {}: now at iteration {}", executionId, iteration);
+    }
+
+    public void incrementToolExecutionCount() {
+        this.toolExecutionCount++;
+        this.updatedAt = LocalDateTime.now();
+        log.debug("Incremented tool execution count in context {}: now at {}", executionId, toolExecutionCount);
+    }
+
+    public void incrementKnowledgeSearchCount() {
+        this.knowledgeSearchCount++;
+        this.updatedAt = LocalDateTime.now();
+        log.debug("Incremented knowledge search count in context {}: now at {}", executionId, knowledgeSearchCount);
+    }
+
+    public void incrementStateTransitionCount() {
+        this.stateTransitionCount++;
+        this.updatedAt = LocalDateTime.now();
+        log.debug("Incremented state transition count in context {}: now at {}", executionId, stateTransitionCount);
+    }
+
+    public void incrementConsecutiveNoProgress() {
+        this.consecutiveNoProgress++;
+        this.updatedAt = LocalDateTime.now();
+        log.debug("Incremented consecutive no-progress count in context {}: now at {}", executionId, consecutiveNoProgress);
+    }
+
+    public void resetConsecutiveNoProgress() {
+        this.consecutiveNoProgress = 0;
+        this.updatedAt = LocalDateTime.now();
+        log.debug("Reset consecutive no-progress count in context {}", executionId);
+    }
+
+    /**
+     * Record a progress event - replaces stuck counters with event-driven progress tracking
+     */
+    public void recordProgress(ProgressType progressType) {
+        this.lastProgressTimestamp = LocalDateTime.now();
+        this.lastProgressType = progressType;
+        this.progressCount++;
+        this.consecutiveNoProgress = 0; // Reset no-progress counter on meaningful progress
+        this.updatedAt = LocalDateTime.now();
+        log.debug("Recorded progress event in context {}: type={}, totalProgress={}", 
+                executionId, progressType, progressCount);
+    }
+
     public void setCurrentMilestone(String milestone) {
         if (milestone == null || milestone.isEmpty()) {
             log.warn("Attempted to set null or empty milestone in context {}", executionId);
             return;
         }
 
-        // Prevent milestone rollback - milestones must be monotonic
-        if (this.currentMilestone != null && !this.currentMilestone.isEmpty()) {
-            // Check if this is a rollback attempt
-            if (isRollback(this.currentMilestone, milestone)) {
-                log.error("MILESTONE ROLLBACK PREVENTED: Cannot go from '{}' to '{}'. Milestones must progress forward.", 
-                        this.currentMilestone, milestone);
-                return; // Reject the rollback
-            }
-            
-            // Only add to completed if actually changing
-            if (!this.currentMilestone.equals(milestone)) {
-                this.completedMilestones.add(this.currentMilestone);
-                log.debug("Added milestone '{}' to completed list", this.currentMilestone);
-            }
-        }
-        
+        // Milestone bookkeeping is now owned by WorkflowManager/Runtime, not by ExecutionContext
+        // The runtime will explicitly call addCompletedMilestone when advancing milestones
+        // Rollback prevention is now handled by WorkflowManager.canTransition()
         this.currentMilestone = milestone;
         this.updatedAt = LocalDateTime.now();
         log.debug("Set current milestone in context {}: {}", executionId, milestone);
-    }
-
-    /**
-     * Check if a milestone transition would be a rollback
-     * Milestones must progress forward, never backward
-     */
-    private boolean isRollback(String current, String proposed) {
-        if (current.equals(proposed)) {
-            return false; // Same milestone is not a rollback
-        }
-        
-        // Define milestone order
-        List<String> milestoneOrder = Arrays.asList(
-            "Collect Information",
-            "Collect Overview",
-            "Gather Detailed Information",
-            "Collect Data",
-            "Analyze Information",
-            "Analyze Findings",
-            "Analyze Data",
-            "Generate Outline",
-            "Synthesize Research",
-            "Generate Insights",
-            "Write Document",
-            "Create Report",
-            "Review Document",
-            "Complete"
-        );
-        
-        int currentIndex = milestoneOrder.indexOf(current);
-        int proposedIndex = milestoneOrder.indexOf(proposed);
-        
-        if (currentIndex == -1 || proposedIndex == -1) {
-            // Unknown milestones - use string comparison as fallback
-            return current.compareTo(proposed) > 0;
-        }
-        
-        return proposedIndex < currentIndex;
     }
 
     public String getCurrentMilestone() {

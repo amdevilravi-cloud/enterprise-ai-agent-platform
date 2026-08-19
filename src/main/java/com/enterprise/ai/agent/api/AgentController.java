@@ -4,6 +4,7 @@ import com.enterprise.ai.agent.agent.Agent;
 import com.enterprise.ai.agent.agent_runtime.ExecutionContext;
 import com.enterprise.ai.agent.agent_runtime.ExecutionContextManager;
 import com.enterprise.ai.agent.artifact.ArtifactManager;
+import com.enterprise.ai.agent.config.CorrelationIdUtil;
 import com.enterprise.ai.agent.model.*;
 import com.enterprise.ai.agent.planner.Planner;
 import com.enterprise.ai.agent.tools.Tool;
@@ -44,7 +45,8 @@ public class AgentController {
     @PostMapping("/execute")
     @Operation(summary = "Execute agent request", description = "Execute an agent request with the given goal")
     public ResponseEntity<AgentResponse> executeAgent(@Valid @RequestBody AgentRequest request) {
-        log.info("Received agent execution request for goal: {}", request.getGoal());
+        String correlationId = CorrelationIdUtil.getCorrelationId();
+        log.info("[{}] Received agent execution request for goal: {}", correlationId, request.getGoal());
         AgentResponse response = agent.execute(request);
         return ResponseEntity.ok(response);
     }
@@ -52,7 +54,8 @@ public class AgentController {
     @PostMapping("/plan")
     @Operation(summary = "Generate plan", description = "Generate a plan without executing it")
     public ResponseEntity<PlanningResult> generatePlan(@Valid @RequestBody AgentRequest request) {
-        log.info("Received plan generation request for goal: {}", request.getGoal());
+        String correlationId = CorrelationIdUtil.getCorrelationId();
+        log.info("[{}] Received plan generation request for goal: {}", correlationId, request.getGoal());
         ExecutionContext context = ExecutionContext.create(request.getGoal());
         PlanningResult plan = planner.createPlan(context);
         contextManager.discardContext(context.getExecutionId());
@@ -62,7 +65,8 @@ public class AgentController {
     @PostMapping("/tool")
     @Operation(summary = "Execute single tool", description = "Execute a single tool with the given parameters")
     public ResponseEntity<ToolResult> executeTool(@Valid @RequestBody ToolRequest request) {
-        log.info("Received tool execution request for tool: {}", request.getToolName());
+        String correlationId = CorrelationIdUtil.getCorrelationId();
+        log.info("[{}] Received tool execution request for tool: {}", correlationId, request.getToolName());
         Tool tool = toolRegistry.get(request.getToolName());
         if (tool == null) {
             return ResponseEntity.badRequest().build();
@@ -101,7 +105,8 @@ public class AgentController {
     @GetMapping("/artifacts/{executionId}")
     @Operation(summary = "List artifacts for execution", description = "Get all artifacts generated during an execution")
     public ResponseEntity<List<Artifact>> getArtifactsForExecution(@PathVariable UUID executionId) {
-        log.info("Retrieving artifacts for execution: {}", executionId);
+        String correlationId = CorrelationIdUtil.getCorrelationId();
+        log.info("[{}] Retrieving artifacts for execution: {}", correlationId, executionId);
         List<Artifact> artifacts = artifactManager.listArtifacts(executionId);
         return ResponseEntity.ok(artifacts);
     }
@@ -109,7 +114,8 @@ public class AgentController {
     @GetMapping("/artifact/{artifactId}")
     @Operation(summary = "Get artifact by ID", description = "Get a specific artifact by its ID")
     public ResponseEntity<Artifact> getArtifact(@PathVariable UUID artifactId) {
-        log.info("Retrieving artifact: {}", artifactId);
+        String correlationId = CorrelationIdUtil.getCorrelationId();
+        log.info("[{}] Retrieving artifact: {}", correlationId, artifactId);
         Artifact artifact = artifactManager.getArtifact(artifactId);
         if (artifact == null) {
             return ResponseEntity.notFound().build();
@@ -120,7 +126,8 @@ public class AgentController {
     @GetMapping("/artifact/{artifactId}/versions")
     @Operation(summary = "Get artifact versions", description = "Get all versions of an artifact")
     public ResponseEntity<List<Artifact>> getArtifactVersions(@PathVariable UUID artifactId) {
-        log.info("Retrieving versions for artifact: {}", artifactId);
+        String correlationId = CorrelationIdUtil.getCorrelationId();
+        log.info("[{}] Retrieving versions for artifact: {}", correlationId, artifactId);
         List<Artifact> versions = artifactManager.getArtifactVersions(artifactId);
         return ResponseEntity.ok(versions);
     }
@@ -128,7 +135,8 @@ public class AgentController {
     @PostMapping("/artifact/{artifactId}/rollback/{version}")
     @Operation(summary = "Rollback artifact", description = "Rollback an artifact to a specific version")
     public ResponseEntity<Artifact> rollbackArtifact(@PathVariable UUID artifactId, @PathVariable int version) {
-        log.info("Rolling back artifact {} to version {}", artifactId, version);
+        String correlationId = CorrelationIdUtil.getCorrelationId();
+        log.info("[{}] Rolling back artifact {} to version {}", correlationId, artifactId, version);
         Artifact rolledBack = artifactManager.rollbackArtifact(artifactId, version);
         if (rolledBack == null) {
             return ResponseEntity.badRequest().build();

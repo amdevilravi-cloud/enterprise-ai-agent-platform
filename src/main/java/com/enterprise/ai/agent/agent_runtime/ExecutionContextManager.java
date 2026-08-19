@@ -1,5 +1,6 @@
 package com.enterprise.ai.agent.agent_runtime;
 
+import com.enterprise.ai.agent.config.CorrelationIdUtil;
 import com.enterprise.ai.agent.persistence.ExecutionContextEntity;
 import com.enterprise.ai.agent.persistence.ExecutionContextRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -7,6 +8,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
+import java.util.ArrayList;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
@@ -19,10 +21,11 @@ public class ExecutionContextManager {
 
     private final Map<UUID, ExecutionContext> activeContexts = new ConcurrentHashMap<>();
     private final Map<UUID, AtomicInteger> updateCounters = new ConcurrentHashMap<>();
+    private final Map<UUID, Integer> previousCompletedMilestoneCounts = new ConcurrentHashMap<>();
     private final ExecutionContextRepository repository;
     private final ObjectMapper objectMapper;
     
-    @Value("${context.batch.save.threshold:5}")
+    @Value("${agent.context.batch-save-threshold:10}")
     private int batchSaveThreshold;
 
     public ExecutionContextManager(ExecutionContextRepository repository, ObjectMapper objectMapper) {
@@ -84,24 +87,42 @@ public class ExecutionContextManager {
     public void discardContext(UUID executionId) {
         ExecutionContext context = activeContexts.remove(executionId);
         updateCounters.remove(executionId); // Clean up counter
+        previousCompletedMilestoneCounts.remove(executionId); // Clean up milestone tracking
         if (context != null) {
             context.discard();
             log.info("Discarded execution context: {}", executionId);
         }
         
-        // Mark as completed in database
-        markContextCompleted(executionId);
+        // P1: Don't auto-mark as completed - let caller decide based on outcome
+        // markContextCompleted(executionId);
     }
     
     /**
      * Check if this update represents a milestone completion
+     * Tracks changes in completed milestone count to avoid disabling batching after first milestone
      */
     private boolean isMilestoneCompletion(ExecutionContext context) {
-        // Check if a milestone was just completed
+        UUID executionId = context.getExecutionId();
+        int currentCompletedCount = context.getCompletedMilestones().size();
+        Integer previousCount = previousCompletedMilestoneCounts.get(executionId);
+        
+        // Initialize previous count if not set
+        if (previousCount == null) {
+            previousCompletedMilestoneCounts.put(executionId, currentCompletedCount);
+            return false;
+        }
+        
+        // Check if milestone count increased (new milestone completed)
+        boolean milestoneJustCompleted = currentCompletedCount > previousCount;
+        
+        // Update previous count
+        previousCompletedMilestoneCounts.put(executionId, currentCompletedCount);
+        
+        // Also check if we reached final milestone
         String currentMilestone = context.getCurrentMilestone();
-        return currentMilestone != null && 
-               (currentMilestone.equals("Complete") || 
-                context.getCompletedMilestones().size() > 0);
+        boolean reachedFinal = currentMilestone != null && currentMilestone.equals("Complete");
+        
+        return milestoneJustCompleted || reachedFinal;
     }
 
     public int getActiveContextCount() {
@@ -110,6 +131,7 @@ public class ExecutionContextManager {
     
     /**
      * Save context to database
+     * Distinguishes between critical and non-critical persistence failures
      */
     private void saveContext(ExecutionContext context) {
         try {
@@ -126,22 +148,62 @@ public class ExecutionContextManager {
                     .knowledgeReferences(objectMapper.writeValueAsString(context.getKnowledgeReferences()))
                     .retryHistory(objectMapper.writeValueAsString(context.getRetryHistory()))
                     .metadata(objectMapper.writeValueAsString(context.getMetadata()))
+                    .plan(context.getPlan() != null ? objectMapper.writeValueAsString(context.getPlan()) : null)
+                    .reviews(objectMapper.writeValueAsString(context.getReviews() != null ? context.getReviews() : new ArrayList<>()))
+                    .failures(objectMapper.writeValueAsString(context.getFailures() != null ? context.getFailures() : new ArrayList<>()))
+                    .outputs(objectMapper.writeValueAsString(context.getOutputs() != null ? context.getOutputs() : new ArrayList<>()))
                     .createdAt(context.getCreatedAt())
                     .updatedAt(context.getUpdatedAt())
                     .status("ACTIVE")
                     .build();
-            
+
             // Check if entity already exists
             Optional<ExecutionContextEntity> existing = repository.findByExecutionId(context.getExecutionId());
             if (existing.isPresent()) {
                 entity.setId(existing.get().getId());
             }
-            
+
             repository.save(entity);
-            log.debug("Saved execution context to database: {}", context.getExecutionId());
+            String correlationId = CorrelationIdUtil.getCorrelationId();
+            log.debug("[{}] Saved execution context to database: {}", correlationId, context.getExecutionId());
         } catch (Exception e) {
-            log.error("Failed to save execution context to database: {}", context.getExecutionId(), e);
+            String correlationId = CorrelationIdUtil.getCorrelationId();
+            // Mark context as persistence-degraded in metadata
+            context.getMetadata().put("persistenceStatus", "DEGRADED");
+            context.getMetadata().put("persistenceError", e.getMessage());
+            
+            // Log with appropriate severity based on whether this is a critical checkpoint
+            if (isCriticalCheckpoint(context)) {
+                log.error("[{}] CRITICAL PERSISTENCE FAILURE: Cannot save checkpoint for execution {}. This may cause data loss on crash.", 
+                        correlationId, context.getExecutionId(), e);
+            } else {
+                log.warn("[{}] Non-critical persistence failure for execution {}. Will retry on next checkpoint. Error: {}", 
+                        correlationId, context.getExecutionId(), e.getMessage());
+            }
         }
+    }
+    
+    /**
+     * Determine if this save represents a critical checkpoint
+     * Critical checkpoints occur at milestone completions or after tool executions
+     */
+    private boolean isCriticalCheckpoint(ExecutionContext context) {
+        // Milestone completion is always critical
+        if (context.getCompletedMilestones().size() > 0) {
+            return true;
+        }
+        
+        // After tool execution is critical (has tool results)
+        if (context.getToolResults() != null && !context.getToolResults().isEmpty()) {
+            return true;
+        }
+        
+        // After artifact creation is critical
+        if (context.getArtifactReferences() != null && !context.getArtifactReferences().isEmpty()) {
+            return true;
+        }
+        
+        return false;
     }
     
     /**
@@ -163,26 +225,34 @@ public class ExecutionContextManager {
                     .goal(entity.getGoal())
                     .currentStep(entity.getCurrentStep())
                     .currentMilestone(entity.getCurrentMilestone())
-                    .completedMilestones(objectMapper.readValue(entity.getCompletedMilestones(), 
+                    .completedMilestones(objectMapper.readValue(entity.getCompletedMilestones(),
                             objectMapper.getTypeFactory().constructCollectionType(java.util.List.class, String.class)))
                     .observations(objectMapper.readValue(entity.getObservations(),
-                            objectMapper.getTypeFactory().constructCollectionType(java.util.List.class, 
+                            objectMapper.getTypeFactory().constructCollectionType(java.util.List.class,
                                     com.enterprise.ai.agent.model.Observation.class)))
                     .toolResults(objectMapper.readValue(entity.getToolResults(),
-                            objectMapper.getTypeFactory().constructCollectionType(java.util.List.class, 
+                            objectMapper.getTypeFactory().constructCollectionType(java.util.List.class,
                                     com.enterprise.ai.agent.model.ToolResult.class)))
                     .artifactReferences(objectMapper.readValue(entity.getArtifacts(),
-                            objectMapper.getTypeFactory().constructCollectionType(java.util.List.class, 
+                            objectMapper.getTypeFactory().constructCollectionType(java.util.List.class,
                                     com.enterprise.ai.agent.model.ArtifactReference.class)))
                     .variables(objectMapper.readValue(entity.getVariables(),
                             objectMapper.getTypeFactory().constructMapType(java.util.Map.class, String.class, Object.class)))
                     .knowledgeReferences(objectMapper.readValue(entity.getKnowledgeReferences(),
                             objectMapper.getTypeFactory().constructCollectionType(java.util.List.class, String.class)))
                     .retryHistory(objectMapper.readValue(entity.getRetryHistory(),
-                            objectMapper.getTypeFactory().constructCollectionType(java.util.List.class, 
+                            objectMapper.getTypeFactory().constructCollectionType(java.util.List.class,
                                     ExecutionContext.RetryHistory.class)))
                     .metadata(objectMapper.readValue(entity.getMetadata(),
                             objectMapper.getTypeFactory().constructMapType(java.util.Map.class, String.class, Object.class)))
+                    .plan(entity.getPlan() != null ? objectMapper.readValue(entity.getPlan(),
+                            objectMapper.getTypeFactory().constructType(com.enterprise.ai.agent.model.AgentPlan.class)) : null)
+                    .reviews(objectMapper.readValue(entity.getReviews(),
+                            objectMapper.getTypeFactory().constructCollectionType(java.util.List.class, String.class)))
+                    .failures(objectMapper.readValue(entity.getFailures(),
+                            objectMapper.getTypeFactory().constructCollectionType(java.util.List.class, String.class)))
+                    .outputs(objectMapper.readValue(entity.getOutputs(),
+                            objectMapper.getTypeFactory().constructCollectionType(java.util.List.class, String.class)))
                     .createdAt(entity.getCreatedAt())
                     .updatedAt(entity.getUpdatedAt())
                     .build();
@@ -193,7 +263,8 @@ public class ExecutionContextManager {
             log.info("Loaded execution context from database: {}", executionId);
             return context;
         } catch (Exception e) {
-            log.error("Failed to load execution context from database: {}", executionId, e);
+            String correlationId = CorrelationIdUtil.getCorrelationId();
+            log.error("[{}] Failed to load execution context from database: {}", correlationId, executionId, e);
             return null;
         }
     }
@@ -210,10 +281,33 @@ public class ExecutionContextManager {
                 entity.setUpdatedAt(java.time.LocalDateTime.now());
                 entity.setCompletedAt(java.time.LocalDateTime.now());
                 repository.save(entity);
-                log.debug("Marked execution context as completed: {}", executionId);
+                String correlationId = CorrelationIdUtil.getCorrelationId();
+                log.debug("[{}] Marked execution context as completed: {}", correlationId, executionId);
             }
         } catch (Exception e) {
-            log.error("Failed to mark execution context as completed: {}", executionId, e);
+            String correlationId = CorrelationIdUtil.getCorrelationId();
+            log.error("[{}] Failed to mark execution context as completed: {}", correlationId, executionId, e);
+        }
+    }
+    
+    /**
+     * P1: Mark context as failed in database
+     */
+    public void markContextFailed(UUID executionId, String failureReason) {
+        try {
+            Optional<ExecutionContextEntity> entityOpt = repository.findByExecutionId(executionId);
+            if (entityOpt.isPresent()) {
+                ExecutionContextEntity entity = entityOpt.get();
+                entity.setStatus("FAILED");
+                entity.setUpdatedAt(java.time.LocalDateTime.now());
+                entity.setCompletedAt(java.time.LocalDateTime.now());
+                repository.save(entity);
+                String correlationId = CorrelationIdUtil.getCorrelationId();
+                log.info("[{}] Marked execution context as failed: {} - Reason: {}", correlationId, executionId, failureReason);
+            }
+        } catch (Exception e) {
+            String correlationId = CorrelationIdUtil.getCorrelationId();
+            log.error("[{}] Failed to mark execution context as failed: {}", correlationId, executionId, e);
         }
     }
 }

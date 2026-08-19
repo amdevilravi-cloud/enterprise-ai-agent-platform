@@ -23,6 +23,8 @@ public class ArtifactReference {
     private int version;              // Version number
     private String uri;               // Optional URI for artifact location
     private ArtifactStatus status;    // Artifact lifecycle status
+    private String milestone;          // Milestone during which this artifact was created
+    private String parentArtifactKey;  // Parent artifact key for lineage tracking
 
     public enum ArtifactStatus {
         CREATED,

@@ -100,18 +100,20 @@ public class KnowledgeSearchTool implements Tool {
             if (response != null) {
                 String answer = (String) response.get("answer");
                 Boolean isFromContext = (Boolean) response.get("isFromContext");
-                Integer retrievalCount = (Integer) response.get("retrievalCount");
+                Integer retrievalResultCount = (Integer) response.get("retrievalCount");
 
                 // Store knowledge reference in context
                 if (isFromContext != null && isFromContext) {
                     context.addKnowledgeReference(query);
-                    context.setVariable("retrievalCount", retrievalCount);
+                    // Store retrieval result count separately from search count
+                    // This is the number of items retrieved, NOT the number of search operations
+                    context.setVariable("retrievalResultCount", retrievalResultCount);
                 }
 
                 Map<String, Object> data = new HashMap<>();
                 data.put("answer", answer);
                 data.put("isFromContext", isFromContext);
-                data.put("retrievalCount", retrievalCount);
+                data.put("retrievalResultCount", retrievalResultCount);
 
                 // Cache the result
                 cacheResult(normalizedQuery, answer, data);

@@ -25,6 +25,8 @@ public class ExecutionState {
     @Builder.Default
     private List<AgentAction> completedActions = new ArrayList<>();
     @Builder.Default
+    private List<AgentAction> failedActions = new ArrayList<>();
+    @Builder.Default
     private List<AgentAction> pendingActions = new ArrayList<>();
     @Builder.Default
     private List<Observation> observations = new ArrayList<>();
@@ -40,6 +42,10 @@ public class ExecutionState {
 
     public void addCompletedAction(AgentAction action) {
         this.completedActions.add(action);
+    }
+
+    public void addFailedAction(AgentAction action) {
+        this.failedActions.add(action);
     }
 
     public void addObservation(Observation observation) {

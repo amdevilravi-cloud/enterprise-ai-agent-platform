@@ -1,12 +1,11 @@
 package com.enterprise.ai.agent.planner;
 
 import com.enterprise.ai.agent.agent_runtime.ExecutionContext;
-import com.enterprise.ai.agent.memory.KnowledgeMemory;
 import com.enterprise.ai.agent.model.AgentAction;
-import com.enterprise.ai.agent.model.AgentPlan;
 import com.enterprise.ai.agent.model.AgentState;
-import com.enterprise.ai.agent.model.KnowledgeNode;
 import com.enterprise.ai.agent.model.PlanningResult;
+import com.enterprise.ai.agent.model.ToolOutcome;
+import com.enterprise.ai.agent.workflow.MilestoneDefinition;
 import com.enterprise.ai.agent.workflow.ToolSchema;
 import com.enterprise.ai.agent.workflow.WorkflowManager;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -20,8 +19,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.TimeUnit;
 
 @Component
 @Slf4j
@@ -29,7 +26,6 @@ public class LLMPlanner implements Planner {
 
     private final ChatClient chatClient;
     private final ObjectMapper objectMapper;
-    private final KnowledgeMemory knowledgeMemory;
     private final WorkflowManager workflowManager;
     
     @Value("${planner.stuck.iteration.threshold:3}")
@@ -38,10 +34,9 @@ public class LLMPlanner implements Planner {
     private static final String ERR_SELF_TRANSITION = "STATE_TRANS_006";
 
     public LLMPlanner(ChatClient.Builder chatClientBuilder, ObjectMapper objectMapper, 
-                      KnowledgeMemory knowledgeMemory, WorkflowManager workflowManager) {
+                      WorkflowManager workflowManager) {
         this.chatClient = chatClientBuilder.build();
         this.objectMapper = objectMapper;
-        this.knowledgeMemory = knowledgeMemory;
         this.workflowManager = workflowManager;
     }
 
@@ -77,8 +72,8 @@ public class LLMPlanner implements Planner {
                     .content();
 
             PlanningResult result = parsePlanningResult(response, context);
-            log.info("Generated planning result: currentState={}, nextState={}, milestone={}, nextStep={}, confidence={}, actions={}", 
-                    result.getCurrentState(), result.getNextState(), result.getMilestone(), result.getNextStep(), 
+            log.info("Generated planning result: nextState={}, milestone={}, nextStep={}, confidence={}, actions={}", 
+                    result.getNextState(), result.getMilestone(), result.getNextStep(), 
                     result.getConfidence(), result.getActions().size());
             
             return result;
@@ -116,6 +111,8 @@ public class LLMPlanner implements Planner {
         if (context.getToolResults().size() >= 3) {
             long knowledgeSearchCount = context.getToolResults().stream()
                     .filter(tr -> tr.getToolName().equals("knowledge_search"))
+                    .filter(tr -> Boolean.TRUE.equals(tr.isSuccess()))
+                    .filter(tr -> tr.getOutcome() == null || tr.getOutcome() != ToolOutcome.SKIPPED_DUPLICATE)
                     .count();
             
             // If 80%+ of recent tool results are knowledge_search, we're stuck
@@ -210,61 +207,41 @@ public class LLMPlanner implements Planner {
     
     /**
      * Create a result to avoid duplicate planning
+     * NOTE: Planner no longer controls milestone progression
      */
     private PlanningResult createDuplicateAvoidanceResult(ExecutionContext context) {
-        String currentMilestone = context.getCurrentMilestone();
         AgentState nextState = AgentState.ANALYZE;
         String nextStep = "Analyze collected information to avoid redundant searches";
         
-        if (currentMilestone != null && currentMilestone.contains("Generate")) {
-            nextState = AgentState.GENERATE_ARTIFACT;
-            nextStep = "Generate artifact using collected information";
-        }
-        
-        // Create a different action instead of returning empty list
-        List<AgentAction> differentActions = new ArrayList<>();
-        
-        // If we're stuck on knowledge_search, try a different approach
-        if (context.getToolResults().stream().anyMatch(tr -> tr.getToolName().equals("knowledge_search"))) {
-            // Try to analyze what we have instead of searching more
-            AgentAction analyzeAction = AgentAction.builder()
-                    .actionId(UUID.randomUUID())
-                    .toolName("calculator") // Use a different tool to break the loop
-                    .purpose("Analyze collected information")
-                    .parameters(Map.of("operation", "analyze"))
-                    .build();
-            differentActions.add(analyzeAction);
-        }
-        
+        // Use state machine instead of fake tool calls
+        // Return empty actions and let the state machine handle progression
         return PlanningResult.builder()
-                .reasoning("Duplicate action detected. Switching to analysis phase to avoid redundant searches.")
-                .currentState(AgentState.EXECUTE)
+                .reasoning("Duplicate action detected. Existing results are sufficient. Transitioning to analysis phase.")
                 .nextState(nextState)
-                .milestone(currentMilestone)
+                .milestone(null) // Planner no longer controls milestone
                 .nextStep(nextStep)
                 .confidence(0.9)
-                .actions(differentActions)
+                .actions(new ArrayList<>()) // No tool call - let state machine handle progression
                 .build();
     }
     
     /**
      * Create fallback result for stuck states
+     * NOTE: Planner no longer controls milestone progression
      */
     private PlanningResult createStuckStateFallback(ExecutionContext context) {
-        String currentMilestone = context.getCurrentMilestone();
         AgentState fallbackState = AgentState.GENERATE_ARTIFACT;
         String fallbackStep = "Generate artifact to break deadlock";
         
-        if (currentMilestone != null && currentMilestone.contains("Collect")) {
+        if (context.getCurrentMilestone() != null && context.getCurrentMilestone().contains("Collect")) {
             fallbackState = AgentState.ANALYZE;
             fallbackStep = "Analyze collected information and proceed";
         }
         
         return PlanningResult.builder()
                 .reasoning("Early termination: Stuck in milestone for " + context.getCurrentStep() + " iterations. Forcing progression.")
-                .currentState(fallbackState)
                 .nextState(fallbackState)
-                .milestone(currentMilestone)
+                .milestone(null) // Planner no longer controls milestone
                 .nextStep(fallbackStep)
                 .confidence(0.7)
                 .actions(new ArrayList<>())
@@ -342,8 +319,30 @@ public class LLMPlanner implements Planner {
         if (!context.getArtifactReferences().isEmpty()) {
             prompt.append("CREATED ARTIFACTS:\n");
             context.getArtifactReferences().forEach(ref -> {
-                prompt.append("  - [").append(ref.getType()).append("] ").append(ref.getName()).append("\n");
+                prompt.append("  - [").append(ref.getType()).append("] ").append(ref.getName())
+                      .append(" (ID: ").append(ref.getArtifactId()).append(")\n");
             });
+            prompt.append("\n");
+        }
+        
+        // P1-5: Knowledge gaps - show what information was sought but not found
+        if (!context.getKnowledgeGaps().isEmpty()) {
+            prompt.append("=== KNOWLEDGE GAPS ===\n");
+            prompt.append("The following information was sought but NOT found in the knowledge base:\n");
+            context.getKnowledgeGaps().forEach(gap -> {
+                prompt.append("  - Topic: ").append(gap.getTopic()).append("\n");
+                prompt.append("    Status: ").append(gap.getStatus()).append("\n");
+                prompt.append("    Attempts: ").append(gap.getAttempts()).append("\n");
+                if (!gap.getQueries().isEmpty()) {
+                    prompt.append("    Queries tried: ").append(String.join(", ", gap.getQueries())).append("\n");
+                }
+            });
+            prompt.append("\n");
+            prompt.append("IMPORTANT: These gaps represent known missing information. ");
+            prompt.append("You may choose to:\n");
+            prompt.append("  1. Try different retrieval strategies for these topics\n");
+            prompt.append("  2. Proceed with documented evidence gaps\n");
+            prompt.append("  3. Ask user for clarification on these topics\n");
             prompt.append("\n");
         }
         
@@ -353,6 +352,8 @@ public class LLMPlanner implements Planner {
         // Add iteration warning if stuck
         int knowledgeSearchCount = (int) context.getToolResults().stream()
                 .filter(tr -> tr.getToolName().equals("knowledge_search"))
+                .filter(tr -> Boolean.TRUE.equals(tr.isSuccess()))
+                .filter(tr -> tr.getOutcome() == null || tr.getOutcome() != ToolOutcome.SKIPPED_DUPLICATE)
                 .count();
         
         if (knowledgeSearchCount >= 3) {
@@ -362,17 +363,9 @@ public class LLMPlanner implements Planner {
             prompt.append("DO NOT perform more knowledge searches.\n\n");
         }
 
-        // Add relevant knowledge from memory - search by execution context, not just goal
-        String knowledgeSearchQuery = buildKnowledgeSearchQuery(context);
-        List<KnowledgeNode> relevantKnowledge = knowledgeMemory.searchKnowledge(knowledgeSearchQuery, 5);
-        if (!relevantKnowledge.isEmpty()) {
-            prompt.append("=== RELEVANT KNOWLEDGE FROM MEMORY ===\n");
-            relevantKnowledge.forEach(node -> {
-                prompt.append("- [").append(node.getSource()).append("] ")
-                      .append(node.getContent()).append("\n");
-            });
-            prompt.append("\n");
-        }
+        // NOTE: Knowledge retrieval now happens through knowledge_search tool only
+        // Planner no longer performs implicit knowledge searches during planning
+        // This separates planning concerns from knowledge retrieval concerns
 
         prompt.append("=== TOOL PARAMETERS ===\n");
         prompt.append("knowledge_search: Requires 'query' parameter (string)\n");
@@ -383,7 +376,6 @@ public class LLMPlanner implements Planner {
 
         prompt.append("=== AVAILABLE TOOLS ===\n");
         prompt.append("- knowledge_search: Search the knowledge base for information (parameters: query)\n");
-        prompt.append("- calculator: Perform mathematical calculations\n");
         prompt.append("- document_generator: Generate documents using LLM (parameters: topic, content)\n");
         prompt.append("- outline_generator: Generate structured outlines (parameters: topic, content, outlineType)\n");
         prompt.append("- file_writer: Write content to filesystem (parameters: filename, content)\n");
@@ -419,6 +411,18 @@ public class LLMPlanner implements Planner {
             if (!recommendedTools.isEmpty()) {
                 prompt.append("Current milestone: ").append(currentMilestone).append("\n");
                 prompt.append("Recommended tools: ").append(String.join(", ", recommendedTools)).append("\n");
+                prompt.append("IMPORTANT: You MUST use EXECUTE state to call these tools. Do not use ANALYZE state when tools are required.\n");
+                prompt.append("\n");
+            }
+
+            // Check if milestone requires specific tool execution
+            MilestoneDefinition milestoneDef = workflowManager.getMilestoneDefinition(currentMilestone);
+            if (milestoneDef != null && milestoneDef.getCompletionPolicy() != null
+                    && milestoneDef.getCompletionPolicy().isRequiresToolExecution()
+                    && milestoneDef.getCompletionPolicy().getRequiredTool() != null) {
+                prompt.append("CRITICAL: This milestone REQUIRES execution of tool: ")
+                      .append(milestoneDef.getCompletionPolicy().getRequiredTool()).append("\n");
+                prompt.append("You MUST use EXECUTE state to call this tool. The milestone will NOT complete without successful tool execution.\n");
                 prompt.append("\n");
             }
         }
@@ -456,24 +460,19 @@ public class LLMPlanner implements Planner {
         prompt.append("4. Maximum 3 knowledge searches total - after that, move to ANALYZE.\n");
         prompt.append("5. Use ANALYZE state to synthesize collected information.\n");
         prompt.append("6. Use GENERATE_ARTIFACT state to create deliverables.\n");
-        prompt.append("7. Set currentState=EXECUTE when you want to run tools.\n");
         prompt.append("8. Be specific and purposeful in your actions.\n");
         prompt.append("\n");
 
         prompt.append("=== DECISION REQUIRED ===\n");
         prompt.append("Based on the current execution state above, determine:\n");
         prompt.append("1. What is the best action to take NOW?\n");
-        prompt.append("2. Is the current milestone complete?\n");
-        prompt.append("3. What should be the next step?\n");
+        prompt.append("2. What should be the next step?\n");
         prompt.append("\n");
 
         prompt.append("Respond with a JSON object in the following format. Return ONLY the JSON, no other text:\n");
         prompt.append("{\n");
         prompt.append("  \"reasoning\": \"Your reasoning for the plan in plain text\",\n");
-        prompt.append("  \"currentState\": \"PLAN|EXECUTE|OBSERVE|ANALYZE|GENERATE_ARTIFACT|RESPOND|FINISH\",\n");
         prompt.append("  \"nextState\": \"PLAN|EXECUTE|OBSERVE|ANALYZE|GENERATE_ARTIFACT|RESPOND|FINISH\",\n");
-        prompt.append("  \"milestone\": \"Current milestone (keep same unless milestone is complete)\",\n");
-        prompt.append("  \"milestoneComplete\": true/false,\n");
         prompt.append("  \"nextStep\": \"Specific next step description\",\n");
         prompt.append("  \"confidence\": 0.0 to 1.0,\n");
         prompt.append("  \"actions\": [\n");
@@ -499,16 +498,6 @@ public class LLMPlanner implements Planner {
             // Parse reasoning
             String reasoning = rootNode.has("reasoning") ? rootNode.get("reasoning").asText() : "No reasoning provided";
             
-            // Parse currentState
-            AgentState currentState = AgentState.PLAN;
-            if (rootNode.has("currentState")) {
-                try {
-                    currentState = AgentState.valueOf(rootNode.get("currentState").asText());
-                } catch (IllegalArgumentException e) {
-                    log.warn("Unknown currentState value: {}, defaulting to PLAN", rootNode.get("currentState").asText());
-                }
-            }
-            
             // Parse nextState
             AgentState nextState = AgentState.PLAN;
             if (rootNode.has("nextState")) {
@@ -518,9 +507,6 @@ public class LLMPlanner implements Planner {
                     log.warn("Unknown nextState value: {}, defaulting to PLAN", rootNode.get("nextState").asText());
                 }
             }
-            
-            // Parse milestone
-            String milestone = rootNode.has("milestone") ? rootNode.get("milestone").asText() : "";
             
             // Parse nextStep
             String nextStep = rootNode.has("nextStep") ? rootNode.get("nextStep").asText() : "Continue execution";
@@ -543,13 +529,16 @@ public class LLMPlanner implements Planner {
                 }
             }
             
+            // P0-2: Planner no longer controls milestone progression
+            // Milestone is set to null - WorkflowManager owns milestone transitions
+            String currentMilestone = null; // Planner no longer controls milestone
+            
             // Validate and correct state transitions
             PlanningResult result = validateAndCorrectTransitions(
                 PlanningResult.builder()
                     .reasoning(reasoning)
-                    .currentState(currentState)
                     .nextState(nextState)
-                    .milestone(milestone)
+                    .milestone(currentMilestone) // Null - planner doesn't control milestone
                     .nextStep(nextStep)
                     .confidence(confidence)
                     .actions(actions)
@@ -569,9 +558,15 @@ public class LLMPlanner implements Planner {
      * Validate and correct state transitions to prevent infinite loops
      */
     private PlanningResult validateAndCorrectTransitions(PlanningResult result, ExecutionContext context) {
-        AgentState currentState = result.getCurrentState();
+        AgentState currentState = context.getCurrentState();
         AgentState nextState = result.getNextState();
         String currentMilestone = context.getCurrentMilestone();
+        
+        // FINISH is terminal - no transition validation required
+        if (currentState == AgentState.FINISH) {
+            log.debug("FINISH is terminal. No transition validation required.");
+            return result.toBuilder().nextState(AgentState.FINISH).build();
+        }
         
         // Use state transition validation matrix
         if (!isValidTransition(currentState, nextState)) {
@@ -601,8 +596,10 @@ public class LLMPlanner implements Planner {
             } else if (currentState == AgentState.EXECUTE) {
                 // After execution, should observe or analyze
                 int knowledgeSearchCount = (int) context.getToolResults().stream()
-                    .filter(tr -> tr.getToolName().equals("knowledge_search"))
-                    .count();
+                        .filter(tr -> tr.getToolName().equals("knowledge_search"))
+                        .filter(tr -> Boolean.TRUE.equals(tr.isSuccess()))
+                        .filter(tr -> tr.getOutcome() == null || tr.getOutcome() != ToolOutcome.SKIPPED_DUPLICATE)
+                        .count();
                 
                 if (knowledgeSearchCount >= 3) {
                     result = result.toBuilder()
@@ -637,13 +634,14 @@ public class LLMPlanner implements Planner {
         // Prevent infinite EXECUTE->ANALYZE loops when stuck
         int knowledgeSearchCount = (int) context.getToolResults().stream()
             .filter(tr -> tr.getToolName().equals("knowledge_search"))
+            .filter(tr -> Boolean.TRUE.equals(tr.isSuccess()))
+            .filter(tr -> tr.getOutcome() == null || tr.getOutcome() != ToolOutcome.SKIPPED_DUPLICATE)
             .count();
         
         if (knowledgeSearchCount >= 3 && currentState == AgentState.EXECUTE && nextState == AgentState.ANALYZE) {
             // This pattern indicates the planner is stuck in a loop
             log.warn("Detected EXECUTE->ANALYZE loop with {} knowledge searches. Forcing artifact generation.", knowledgeSearchCount);
             result = result.toBuilder()
-                .currentState(AgentState.GENERATE_ARTIFACT)
                 .nextState(AgentState.GENERATE_ARTIFACT)
                 .nextStep("Generate artifact to break execution loop")
                 .build();
@@ -747,69 +745,10 @@ public class LLMPlanner implements Planner {
         return params;
     }
 
-    /**
-     * Build a knowledge search query based on execution context rather than just the goal.
-     * This provides more targeted knowledge retrieval using semantic key terms.
-     */
-    private String buildKnowledgeSearchQuery(ExecutionContext context) {
-        StringBuilder query = new StringBuilder();
-        
-        // Start with goal (most important for semantic meaning)
-        query.append(context.getGoal());
-        
-        // Add current milestone for context
-        if (context.getCurrentMilestone() != null) {
-            query.append(" ").append(context.getCurrentMilestone());
-        }
-        
-        // Extract semantic key terms from recent observations
-        if (!context.getObservations().isEmpty()) {
-            // Get the last 2 observations for context
-            int limit = Math.min(2, context.getObservations().size());
-            for (int i = context.getObservations().size() - limit; i < context.getObservations().size(); i++) {
-                String obs = context.getObservations().get(i).getContent();
-                if (obs != null && obs.length() > 0) {
-                    // Extract key terms: first 50 chars + significant words
-                    String keyTerms = extractKeyTerms(obs);
-                    if (!keyTerms.isEmpty()) {
-                        query.append(" ").append(keyTerms);
-                    }
-                }
-            }
-        }
-        
-        return query.toString();
-    }
-    
-    /**
-     * Extract key terms from observation text for semantic search
-     */
-    private String extractKeyTerms(String text) {
-        // Take first 50 characters as primary context
-        String primary = text.length() > 50 ? text.substring(0, 50) : text;
-        
-        // Extract significant words (words longer than 4 characters)
-        String[] words = text.split("\\s+");
-        StringBuilder significantWords = new StringBuilder();
-        
-        for (String word : words) {
-            // Remove punctuation and check length
-            String cleanWord = word.replaceAll("[^a-zA-Z0-9]", "");
-            if (cleanWord.length() > 4) {
-                significantWords.append(" ").append(cleanWord);
-            }
-            // Limit to avoid overly long queries
-            if (significantWords.length() > 100) break;
-        }
-        
-        return primary + significantWords.toString();
-    }
-
     private PlanningResult createFallbackResult(ExecutionContext context) {
         log.warn("Creating fallback planning result for execution: {}", context.getExecutionId());
         return PlanningResult.builder()
                 .reasoning("Unable to generate plan due to error. Providing direct response.")
-                .currentState(AgentState.FINISH)
                 .nextState(AgentState.FINISH)
                 .milestone("Error recovery")
                 .nextStep("FINISHED")

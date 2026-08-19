@@ -1,8 +1,10 @@
 package com.enterprise.ai.agent.tools;
 
+import com.enterprise.ai.agent.workflow.ToolSchema;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
+import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -11,6 +13,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public class ToolRegistryImpl implements ToolRegistry {
 
     private final Map<String, Tool> tools = new ConcurrentHashMap<>();
+    private final Map<String, ToolSchema> toolSchemas = new ConcurrentHashMap<>();
 
     public ToolRegistryImpl() {
         log.info("ToolRegistry initialized");
@@ -34,6 +37,25 @@ public class ToolRegistryImpl implements ToolRegistry {
     @Override
     public boolean hasTool(String toolName) {
         return tools.containsKey(toolName);
+    }
+
+    @Override
+    public ToolSchema getToolSchema(String toolName) {
+        return toolSchemas.get(toolName);
+    }
+
+    @Override
+    public Map<String, ToolSchema> getAllToolSchemas() {
+        return new HashMap<>(toolSchemas);
+    }
+
+    /**
+     * Register a tool schema for a registered tool.
+     * This allows ToolRegistry to be the single source of truth for tool schemas.
+     */
+    public void registerToolSchema(String toolName, ToolSchema schema) {
+        toolSchemas.put(toolName, schema);
+        log.info("Registered tool schema: {}", toolName);
     }
 
     public int getToolCount() {

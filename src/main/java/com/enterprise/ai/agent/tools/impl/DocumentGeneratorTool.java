@@ -112,6 +112,8 @@ public class DocumentGeneratorTool implements Tool {
                     .type("document")
                     .version(createdArtifact.getVersion())
                     .status(ArtifactReference.ArtifactStatus.CREATED)
+                    .milestone(context.getCurrentMilestone())
+                    .parentArtifactKey(request.getParameters().get("parentArtifactKey") != null ? request.getParameters().get("parentArtifactKey").toString() : null)
                     .build();
 
             List<ArtifactReference> artifacts = new ArrayList<>();
